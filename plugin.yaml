@@ -1,0 +1,31 @@
+name: iroh-channel
+label: Iroh Channel
+kind: platform
+version: 1.0.0
+description: >
+  Peer-to-peer Iroh channel for Hermes Agent. Clients dial the node by ticket and
+  exchange newline-delimited JSON frames over an authenticated QUIC connection.
+author: iroh-channel contributors
+tags:
+  - platform
+  - iroh
+  - p2p
+  - quic
+  - channel
+optional_env:
+  - name: HERMES_IROH_ALLOWLIST
+    description: >
+      Comma- or whitespace-separated client node ids, unioned with
+      allowlist.json. An empty allowlist denies every client.
+    prompt: Bootstrap client node ids (comma-separated, or empty)
+    password: false
+  - name: HERMES_IROH_RELAY
+    description: >
+      Relay mode: empty for the n0 default relays, disabled/off/none to disable
+      relaying, or a comma-separated list of http(s) relay URLs.
+    prompt: Relay mode or relay URLs (or empty for the default)
+    password: false
+  - name: HERMES_IROH_TURN_TIMEOUT
+    description: "Seconds to wait for a gateway turn before the stream fails with timeout"
+    prompt: Turn timeout in seconds (default 600)
+    password: false
