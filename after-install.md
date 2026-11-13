@@ -9,25 +9,25 @@ The plugin name is `iroh-channel`; the platform it registers is `iroh`.
 
 ```bash
 hermes plugins enable iroh-channel
-hermes config set platforms.iroh.enabled true
+hermes config set gateway.platforms.iroh.enabled true
 hermes gateway restart
 ```
 
 ### 2. Check the `iroh` dependency
 
 The plugin loads without the Python SDK, but the platform stays unavailable and
-starts no endpoint. Hermes prepares `iroh>=1.2,<2` from `pyproject.toml` when the
-plugin is enabled; verify with:
+starts no endpoint. `hermes plugins enable` is what prepares `iroh>=1.2,<2` from
+`pyproject.toml`; it asks for consent before installing into the managed
+environment. Verify with:
 
 ```bash
 python3 -c "import iroh; print(iroh.__version__)"
 ```
 
-If that fails, install it into the Hermes environment:
-
-```bash
-pip install 'iroh>=1.2,<2'
-```
+If that fails, re-run `hermes plugins enable iroh-channel` and accept the
+dependency prompt. Do not `pip install iroh` into the environment by hand: a
+manual install is not part of the managed dependency set and is not retained
+when Hermes rebuilds that environment.
 
 ### 3. Get the node id and ticket
 
@@ -88,8 +88,8 @@ instead of silently changing the identity.
 
 | Issue | Solution |
 |-------|----------|
-| Platform never starts | Enable it: `hermes config set platforms.iroh.enabled true`, then `hermes gateway restart` |
-| `check_fn` reports unavailable | The `iroh` package is not importable: `pip install 'iroh>=1.2,<2'` |
+| Platform never starts | Enable it: `hermes config set gateway.platforms.iroh.enabled true`, then `hermes gateway restart` |
+| `check_fn` reports unavailable | The `iroh` package is not importable: re-run `hermes plugins enable iroh-channel` and accept the dependency prompt |
 | Client connects, then is immediately closed | Its node id is not allowlisted: run `/iroh_allow <node_id>` and reconnect |
 | `ticket: unavailable` | The endpoint is not bound — the platform is disabled or the SDK is missing |
 | Clients on another network cannot connect | Relaying is disabled (`HERMES_IROH_RELAY=disabled`) and no direct address is reachable |

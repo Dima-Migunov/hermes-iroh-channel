@@ -7,8 +7,7 @@ over QUIC bidirectional streams. No inbound port, no platform account, and no
 relay account are required to run the plugin.
 
 This repository is the plugin directory: install it with
-`hermes plugins install owner/iroh-channel`, or from a local checkout with
-`hermes plugins install ./Iroh-channel`.
+`hermes plugins install Dima-Migunov/iroh-channel`.
 
 ## Layout
 
@@ -30,57 +29,64 @@ plain Python environment. Hermes imports live inside
 
 ```bash
 # from GitHub
-hermes plugins install owner/iroh-channel
-
-# or from the parent directory of a local checkout
-hermes plugins install ./Iroh-channel
+hermes plugins install Dima-Migunov/iroh-channel
 ```
 
-Install leaves the plugin disabled. Enable the plugin (loads `register()`) and the
-platform (binds the endpoint) — they are two separate switches:
+The install clones the repository into `~/.hermes/plugins/iroh-channel/`.
+Install leaves the plugin disabled, and asks `Enable 'iroh-channel' now? [y/N]`;
+Answering no is the default. Enabling is a separate, explicit step:
 
 ```bash
 hermes plugins enable iroh-channel
-hermes config set platforms.iroh.enabled true
 hermes gateway restart
 ```
 
-Enabling the plugin is what loads the adapter; the endpoint binds when the gateway
-connects the `iroh` platform. The `iroh` Python package must be importable in the
-Hermes environment; Hermes prepares it from this repository's `pyproject.toml`
-when the plugin is enabled, and without it the plugin still loads but reports the
-platform as unavailable with an install hint and starts no endpoint.
+`hermes plugins enable` is also the step that prepares the plugin's Python
+dependencies: Hermes reads `pyproject.toml` (`iroh>=1.2,<2`), asks for consent,
+and installs it into the managed environment. Do not `pip install iroh`
+yourself — a manually installed package is not part of that managed
+environment and is not retained when Hermes rebuilds it.
+
+Enabling the plugin loads `register()`. The endpoint itself binds when the
+gateway connects the `iroh` platform, which is a second switch:
 
 ```bash
-pip install 'iroh>=1.2,<2'
+hermes config set gateway.platforms.iroh.enabled true
+hermes gateway restart
 ```
 
-Enabling the plugin is what binds the endpoint. The `iroh` Python package must
-be importable in the Hermes environment; without it the plugin still loads, but
-reports the platform as unavailable with an install hint and starts no endpoint.
+Without the `iroh` package the plugin still loads, but reports the platform as
+unavailable with an install hint and starts no endpoint.
+
+For a reproducible install, pin the commit:
 
 ```bash
-pip install 'iroh>=1.2,<2'
+hermes plugins install Dima-Migunov/iroh-channel --ref <40-character-commit-sha>
 ```
+
+To work from a local checkout instead, copy the directory into
+`~/.hermes/plugins/iroh-channel/` and run `hermes plugins enable iroh-channel`.
+`hermes plugins install` takes a catalog name, `owner/repo`, or a Git URL — a
+local filesystem path is not a supported source.
 
 ## Configuration
 
 State lives in the plugin directory itself, so nothing has to be configured: the
 plugin works wherever Hermes installed it, in whichever profile and `HERMES_HOME`.
-The environment variables below are optional overrides.
+These are the three settings the manifest declares, all optional:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `HERMES_IROH_STATE_DIR` | the plugin directory | Override for the directory holding `node.key` and `allowlist.json` |
-| `HERMES_IROH_KEY_PATH` | `$HERMES_IROH_STATE_DIR/node.key` | Node secret key file; overrides only the key path |
 | `HERMES_IROH_ALLOWLIST` | unset | Comma- or whitespace-separated node ids, unioned with the allowlist file |
 | `HERMES_IROH_RELAY` | unset | Relay mode: unset/blank for the n0 default relays, `disabled`/`off`/`none` to disable relaying, or a comma-separated relay URL list |
 | `HERMES_IROH_TURN_TIMEOUT` | `600` | Seconds to wait for a gateway turn before the stream fails with `timeout` |
 
 ### State directory and key file
 
-The node secret is a raw 32-byte Ed25519 key stored at `HERMES_IROH_KEY_PATH`.
-By default it sits next to `plugin.yaml` in the installed plugin directory.
+The node secret is a raw 32-byte Ed25519 key stored next to `plugin.yaml` in the
+installed plugin directory. It is not a manifest setting. For advanced setups two
+path overrides exist: `HERMES_IROH_STATE_DIR` moves the directory, and
+`HERMES_IROH_KEY_PATH` moves only the key file.
 
 - The file is created on first start and is never regenerated, so the node id is
   stable across restarts.

@@ -37,6 +37,9 @@ class ResponseRouter:
         self._terminal: set[str] = set()
 
     def reset(self, chat_id: str) -> None:
+        self.release(chat_id)
+
+    def release(self, chat_id: str) -> None:
         self._last.pop(chat_id, None)
         self._terminal.discard(chat_id)
 
@@ -165,6 +168,7 @@ async def deliver_message(
         await session.append(delta)
     if finalize and service.router.mark_terminal(session.chat_id):
         await session.finish()
+        service.router.release(session.chat_id)
 
 
 def build_prompt_handler(
@@ -209,6 +213,10 @@ def _check_requirements() -> bool:
 def _validate_config(config: Any) -> bool:
     del config
     return transport.iroh_available()
+
+
+def _no_active_stream_result(send_result: Any) -> Any:
+    return send_result(success=False, error="no active iroh stream")
 
 
 def build_adapter_class(
@@ -257,9 +265,7 @@ def build_adapter_class(
             del reply_to
             session = self._session(chat_id)
             if session is None:
-                return send_result(
-                    success=False, error="no active iroh stream"
-                )
+                return _no_active_stream_result(send_result)
             meta = metadata or {}
             finalize = bool(meta.get("notify") or meta.get("final")) or (
                 not meta.get("expect_edits")
@@ -278,9 +284,7 @@ def build_adapter_class(
             del message_id
             session = self._session(chat_id)
             if session is None:
-                return send_result(
-                    success=False, error="no active iroh stream"
-                )
+                return _no_active_stream_result(send_result)
             await deliver_message(service, session, content, finalize=finalize)
             return send_result(success=True, message_id=session.chat_id)
 
@@ -343,25 +347,24 @@ def register(ctx: Any) -> None:
         kwargs["supports_async_delivery"] = False
     ctx.register_platform(**kwargs)
 
-    async def _info_handler(
-        raw_args: str = "", *args: Any, **handler_kwargs: Any
-    ) -> str:
-        del args, handler_kwargs
-        return await handle_info(service, raw_args)
+    def _command_handler(
+        handler: Callable[[ChannelService, str], Any],
+    ) -> Callable[..., Any]:
+        async def _handler(
+            raw_args: str = "", *args: Any, **handler_kwargs: Any
+        ) -> str:
+            del args, handler_kwargs
+            return await handler(service, raw_args)
 
-    async def _allow_handler(
-        raw_args: str = "", *args: Any, **handler_kwargs: Any
-    ) -> str:
-        del args, handler_kwargs
-        return await handle_allow(service, raw_args)
+        return _handler
 
     ctx.register_command(
         name="iroh_info",
-        handler=_info_handler,
+        handler=_command_handler(handle_info),
         description="Show the Iroh node id, ticket, relay mode, and allowlist size",
     )
     ctx.register_command(
         name="iroh_allow",
-        handler=_allow_handler,
+        handler=_command_handler(handle_allow),
         description="Authorize a client node id: /iroh_allow <client_node_id>",
     )

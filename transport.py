@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import tempfile
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional
@@ -21,7 +22,6 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 ALPN = b"iroh-channel/1"
-PROTOCOL_VERSION = 1
 DEFAULT_SESSION_ID = "default"
 
 MAX_PROMPT_BYTES = 64 * 1024
@@ -33,6 +33,7 @@ DEFAULT_TURN_TIMEOUT = 600.0
 DEFAULT_MAX_CONNECTIONS = 64
 DEFAULT_MAX_STREAMS_PER_CONNECTION = 8
 DEFAULT_MAX_TOTAL_STREAMS = 64
+MAX_RECORDED_REJECTIONS = 32
 
 ERR_INVALID_PROMPT = "invalid_prompt"
 ERR_PROMPT_TOO_LARGE = "prompt_too_large"
@@ -124,6 +125,32 @@ def turn_timeout_from_env(default: float = DEFAULT_TURN_TIMEOUT) -> float:
     return value
 
 
+def _write_file_atomic(path: Path, payload: bytes, *, prefix: str) -> None:
+    parent = path.parent
+    created = not parent.exists()
+    parent.mkdir(parents=True, exist_ok=True)
+    if created:
+        try:
+            os.chmod(parent, 0o700)
+        except OSError:
+            logger.debug("could not set 0700 on %s", parent)
+    fd, tmp = tempfile.mkstemp(dir=str(parent), prefix=prefix, suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    NodeKeyStore._sync_directory(parent)
+
+
 class IrohSecretBackend:
     """Thin adapter over the iroh secret-key API."""
 
@@ -193,29 +220,7 @@ class NodeKeyStore:
         return self.backend.node_id(self.load_or_create())
 
     def _write_atomic(self, raw: bytes) -> None:
-        parent = self.path.parent
-        created = not parent.exists()
-        parent.mkdir(parents=True, exist_ok=True)
-        if created:
-            try:
-                os.chmod(parent, 0o700)
-            except OSError:
-                logger.debug("could not set 0700 on %s", parent)
-        fd, tmp = tempfile.mkstemp(dir=str(parent), prefix=".node.key.", suffix=".tmp")
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(raw)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, self.path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        self._sync_directory(parent)
+        _write_file_atomic(self.path, raw, prefix=".node.key.")
 
     @staticmethod
     def _sync_directory(path: Path) -> None:
@@ -397,34 +402,12 @@ class Allowlist:
         return normalized
 
     def _write_atomic(self, entries: Iterable[str]) -> None:
-        parent = self.path.parent
-        created = not parent.exists()
-        parent.mkdir(parents=True, exist_ok=True)
-        if created:
-            try:
-                os.chmod(parent, 0o700)
-            except OSError:
-                logger.debug("could not set 0700 on %s", parent)
         payload = json.dumps(
             {"allowed_node_ids": list(entries)}, indent=2, ensure_ascii=False
         ) + "\n"
-        fd, tmp = tempfile.mkstemp(
-            dir=str(parent), prefix=".allowlist.", suffix=".tmp"
+        _write_file_atomic(
+            self.path, payload.encode("utf-8"), prefix=".allowlist."
         )
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, self.path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        NodeKeyStore._sync_directory(parent)
 
 
 @dataclass(frozen=True)
@@ -524,22 +507,25 @@ async def read_prompt_line(
 
 
 def chunk_text(text: str, limit: int = MAX_DELTA_BYTES) -> list[str]:
+    limit = max(limit, 1)
     encoded = text.encode("utf-8")
     if len(encoded) <= limit:
         return [text] if text else []
     chunks: list[str] = []
-    buffer: list[str] = []
-    size = 0
-    for char in text:
-        width = len(char.encode("utf-8"))
-        if size + width > limit and buffer:
-            chunks.append("".join(buffer))
-            buffer = []
-            size = 0
-        buffer.append(char)
-        size += width
-    if buffer:
-        chunks.append("".join(buffer))
+    remaining = encoded
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining.decode("utf-8"))
+            break
+        cut = limit
+        while cut > 0 and (remaining[cut] & 0xC0) == 0x80:
+            cut -= 1
+        if cut == 0:
+            cut = max(limit, 1)
+            while cut < len(remaining) and (remaining[cut] & 0xC0) == 0x80:
+                cut += 1
+        chunks.append(remaining[:cut].decode("utf-8"))
+        remaining = remaining[cut:]
     return chunks
 
 
@@ -568,7 +554,6 @@ class StreamSession:
         self.started = False
         self.terminal = False
         self.cancelled = False
-        self.frames_sent = 0
         self.deltas_sent = 0
         self.bytes_sent = 0
 
@@ -620,7 +605,6 @@ class StreamSession:
             return
         try:
             await self._send.write_all(encode_frame(frame))
-            self.frames_sent += 1
         except Exception as exc:
             logger.debug("iroh stream write failed: %s", type(exc).__name__)
             self.cancelled = True
@@ -679,13 +663,13 @@ class ChannelServer:
         self._endpoint: Any = None
         self._accept_task: Optional[asyncio.Task] = None
         self._stop_lock: Optional[asyncio.Lock] = None
-        self._connections: list[Any] = []
+        self._connections: set[Any] = set()
         self._connection_tasks: set[asyncio.Task] = set()
         self._stream_tasks: set[asyncio.Task] = set()
         self._sessions: dict[str, StreamSession] = {}
         self._active_connections = 0
         self._active_streams = 0
-        self.rejections: list[str] = []
+        self.rejections: deque[str] = deque(maxlen=MAX_RECORDED_REJECTIONS)
         self._rejection_event = asyncio.Event()
 
     @property
@@ -841,7 +825,7 @@ class ChannelServer:
             self._close_connection(connection, 3, b"connection limit")
             return
         self._active_connections += 1
-        self._connections.append(connection)
+        self._connections.add(connection)
         try:
             await self._serve_connection(connection, remote_id)
         except asyncio.CancelledError:
@@ -852,8 +836,7 @@ class ChannelServer:
             )
         finally:
             self._active_connections -= 1
-            if connection in self._connections:
-                self._connections.remove(connection)
+            self._connections.discard(connection)
 
     @staticmethod
     def _close_connection(connection: Any, code: int, reason: bytes) -> None:
