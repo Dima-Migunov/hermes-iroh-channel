@@ -553,7 +553,6 @@ class StreamSession:
         self.finished = asyncio.Event()
         self.started = False
         self.terminal = False
-        self.slash_prompt = False
         self.cancelled = False
         self.deltas_sent = 0
         self.bytes_sent = 0
@@ -925,7 +924,6 @@ class ChannelServer:
             session_id=prompt.session_id,
             chat_id=chat_id,
         )
-        session.slash_prompt = prompt.text.lstrip().startswith("/")
         self._sessions[chat_id] = session
         try:
             await session.start()
@@ -936,21 +934,67 @@ class ChannelServer:
             handler_task = asyncio.create_task(
                 self._run_handler(handler, session, prompt.text)
             )
+            stopped_task = asyncio.create_task(self._watch_send_stopped(send))
+            finished_task = asyncio.create_task(session.finished.wait())
             try:
-                await asyncio.wait_for(
-                    session.finished.wait(), timeout=self.turn_timeout
+                await self._wait_for_session_end(
+                    session, finished_task, stopped_task
                 )
-            except asyncio.TimeoutError:
-                await session.fail(ERR_TIMEOUT)
             finally:
+                for task in (finished_task, stopped_task):
+                    task.cancel()
                 if not handler_task.done():
                     handler_task.cancel()
-                await asyncio.gather(handler_task, return_exceptions=True)
+                await asyncio.gather(
+                    handler_task, finished_task, stopped_task, return_exceptions=True
+                )
         finally:
             if self._sessions.get(chat_id) is session:
                 self._sessions.pop(chat_id, None)
             if not session.terminal:
                 session.cancel()
+
+    @staticmethod
+    async def _watch_send_stopped(send: Any) -> None:
+        """Resolve as soon as the peer stops reading or drops the stream.
+
+        This also resolves after our own ``finish()``, so callers must check
+        ``session.terminal`` to tell a normal ending from a client stop.
+        """
+        stopped = getattr(send, "stopped", None)
+        if stopped is None:
+            await asyncio.Event().wait()
+            return
+        try:
+            await stopped()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    async def _wait_for_session_end(
+        self,
+        session: "StreamSession",
+        finished_task: asyncio.Task,
+        stopped_task: asyncio.Task,
+    ) -> None:
+        """End the turn on a terminal frame, a client stop, or the turn timeout.
+
+        A client that closes the receive side sends no protocol frame, so the
+        send stream is the only signal it left. Watching it releases the
+        session slot immediately instead of holding it until the turn timeout.
+        """
+        done, _pending = await asyncio.wait(
+            {finished_task, stopped_task},
+            timeout=self.turn_timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if finished_task in done or session.terminal:
+            return
+        if stopped_task in done:
+            logger.debug("iroh client stopped the stream; releasing session")
+            return
+        await session.fail(ERR_TIMEOUT)
 
     async def _run_handler(
         self,

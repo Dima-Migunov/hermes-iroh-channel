@@ -554,3 +554,49 @@ async def test_client_close_mid_response_releases_session(tmp_path):
     finally:
         await server.stop()
         await client_endpoint.close()
+
+
+async def test_client_stop_reading_releases_session_before_turn_timeout(tmp_path):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(session, text):
+        await session.append("first")
+        started.set()
+        await release.wait()
+
+    server, client_endpoint, _server_id, _client_id = await make_endpoints(
+        tmp_path, turn_timeout=60.0
+    )
+    server.set_prompt_handler(handler)
+    try:
+        await server.start()
+        client = await Client.dial(client_endpoint, _addr(server))
+        await client.send_prompt("hi", session_id="s")
+        await asyncio.wait_for(started.wait(), timeout=10)
+        await client.recv.stop(0)
+
+        for _ in range(300):
+            if not server._sessions:
+                break
+            await asyncio.sleep(0.01)
+        assert server._sessions == {}
+        assert server.running is True
+
+        await client.close()
+
+        async def finish_fast(session, text):
+            await session.append("recovered")
+            await session.finish()
+
+        server.set_prompt_handler(finish_fast)
+        retry = await Client.dial(client_endpoint, _addr(server))
+        await retry.send_prompt("again", session_id="s")
+        frames = await retry.read_frames_until_terminal()
+        assert [f["type"] for f in frames] == ["start", "delta", "done"]
+        assert frames[1]["content"] == "recovered"
+        await retry.close()
+    finally:
+        release.set()
+        await server.stop()
+        await client_endpoint.close()

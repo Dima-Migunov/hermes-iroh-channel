@@ -375,9 +375,11 @@ Different session ids, or different node ids, run concurrently.
 ### Close behavior
 
 - The server finishes its send side after `done` or `error`.
-- If the client closes the stream before the terminal frame, the server stops
-  forwarding, releases the session slot, and keeps serving other clients. The
-  Hermes turn may continue, but its output is discarded.
+- If the client closes the stream before the terminal frame, the server notices
+  that the peer stopped reading, stops forwarding, releases the session slot
+  immediately, and keeps serving other clients. The Hermes turn may continue,
+  but its output is discarded. A prompt on the same session id sent right after
+  a stop is accepted instead of answering `session_busy`.
 - Closing one stream never affects another stream or connection.
 
 ### Client walkthrough
