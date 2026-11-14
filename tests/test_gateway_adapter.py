@@ -627,12 +627,26 @@ async def test_allow_rejects_invalid_node_ids(tmp_path, value):
 # --------------------------------------------------------------------------- #
 
 
+# Hermes resolves a user-installed platform name through its platform registry,
+# so `Platform("iroh")` raises until the plugin context has registered the name.
+# The fakes model that ordering; a permissive Platform would hide the bug.
+_FAKE_PLATFORM_NAMES: set[str] = set()
+
+
+class FakePlatform:
+    def __init__(self, name: str) -> None:
+        if name not in _FAKE_PLATFORM_NAMES:
+            raise ValueError(f"'{name}' is not a valid Platform")
+        self.name = name
+
+
 class FakeContext:
     def __init__(self) -> None:
         self.platforms: list[dict] = []
         self.commands: list[dict] = []
 
     def register_platform(self, **kwargs) -> None:
+        _FAKE_PLATFORM_NAMES.add(kwargs["name"])
         self.platforms.append(kwargs)
 
     def register_command(self, **kwargs) -> None:
@@ -658,9 +672,7 @@ def fake_hermes(monkeypatch):
         "gateway.platforms.event": type(sys)("gateway.platforms.event"),
         "gateway.platform_registry": type(sys)("gateway.platform_registry"),
     }
-    modules["gateway.config"].Platform = type(
-        "Platform", (), {"__init__": lambda self, name: setattr(self, "name", name)}
-    )
+    modules["gateway.config"].Platform = FakePlatform
     modules["gateway.platforms.base"].BasePlatformAdapter = FakeAdapterBase
     modules["gateway.platforms.base"].SendResult = FakeSendResult
     modules["gateway.platforms.event"].MessageEvent = FakeEvent
@@ -668,7 +680,11 @@ def fake_hermes(monkeypatch):
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
     gateway_adapter.ChannelService.reset()
-    return modules
+    _FAKE_PLATFORM_NAMES.clear()
+    try:
+        yield modules
+    finally:
+        _FAKE_PLATFORM_NAMES.clear()
 
 
 def test_register_records_one_platform(fake_hermes):
@@ -685,6 +701,19 @@ def test_register_records_one_platform(fake_hermes):
     assert callable(registration["validate_config"])
     assert registration["max_message_length"] == 0
     assert "platform_hint" in registration
+    gateway_adapter.ChannelService.reset()
+
+
+def test_register_then_adapter_factory_constructs_platform(fake_hermes):
+    ctx = FakeContext()
+
+    gateway_adapter.register(ctx)
+
+    factory = ctx.platforms[0]["adapter_factory"]
+    adapter = factory(None)
+
+    assert isinstance(adapter, FakeAdapterBase)
+    assert adapter.platform.name == "iroh"
     gateway_adapter.ChannelService.reset()
 
 

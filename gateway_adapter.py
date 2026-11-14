@@ -318,15 +318,24 @@ def register(ctx: Any) -> None:
     from gateway.platforms.event import MessageEvent
 
     service = ChannelService.get()
-    platform = Platform(PLATFORM_NAME)
-    adapter_class = build_adapter_class(
-        service, BasePlatformAdapter, platform, SendResult, MessageEvent
-    )
+
+    def _adapter_factory(config: Any) -> Any:
+        # Hermes only accepts the platform name after ctx.register_platform has
+        # added it to the platform registry, so construct it when the adapter is
+        # created rather than during plugin registration.
+        adapter_class = build_adapter_class(
+            service,
+            BasePlatformAdapter,
+            Platform(PLATFORM_NAME),
+            SendResult,
+            MessageEvent,
+        )
+        return adapter_class(config)
 
     kwargs: dict[str, Any] = {
         "name": PLATFORM_NAME,
         "label": PLATFORM_LABEL,
-        "adapter_factory": adapter_class,
+        "adapter_factory": _adapter_factory,
         "check_fn": _check_requirements,
         "validate_config": _validate_config,
         "platform_hint": PLATFORM_HINT,
