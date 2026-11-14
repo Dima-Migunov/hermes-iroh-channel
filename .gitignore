@@ -16,6 +16,7 @@ dist/
 .venv/
 venv/
 env/
+.env
 
 .node.key.*.tmp
 .allowlist.*.tmp
