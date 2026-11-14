@@ -522,6 +522,30 @@ restart.
 - **No message chunking.** `max_message_length` is 0, so Hermes does not split
   replies; deltas are bounded by the 16 KiB frame limit instead.
 
+## Releasing
+
+Releases are cut from a clean `main` that matches `origin/main`:
+
+```bash
+scripts/release.sh patch --dry-run   # show the plan, change nothing
+scripts/release.sh patch             # 1.0.0 -> 1.0.1
+```
+
+The script reads the version from `pyproject.toml`, requires it to match
+`plugin.yaml`, computes the next `patch`, `minor`, or `major` version, and runs
+`python3 -m pytest -q`. It then bumps both files, commits
+`chore: release vX.Y.Z`, creates an annotated tag, pushes `main` and the tag
+atomically, and publishes the GitHub release.
+
+Release notes default to the commit subjects since the previous tag. Override
+them with `--notes "..."` or `--notes-file NOTES.md`; use `--repo owner/name`
+when `origin` is not the GitHub repository that should receive the release.
+The GitHub API call needs `GITHUB_TOKEN` in the environment or in `.env` with
+permission to create releases. A dry run does not need it.
+
+If the script stops after pushing, the commit and tag are already on the
+remote; create the release for that tag in the GitHub UI.
+
 ## Tests
 
 ```bash
