@@ -1,8 +1,8 @@
 """Hermes gateway integration for the Iroh channel plugin.
 
-All Hermes imports happen inside ``register()`` and the adapter factory, so this
-module imports cleanly in a plain Python environment. The transport contract it
-consumes lives in ``transport.py``.
+All Hermes imports happen inside ``register()``, so this module imports cleanly
+in a plain Python environment. The transport contract it consumes lives in
+``transport.py``.
 """
 
 from __future__ import annotations
@@ -118,7 +118,7 @@ class ChannelService:
         return self.server.ticket
 
 
-def _endpoint_hint(*, node_id_missing: bool, service: ChannelService) -> str:
+def _endpoint_hint(*, node_id_missing: bool) -> str:
     if not transport.iroh_available():
         return (
             "the iroh Python package is not importable; run "
@@ -128,7 +128,7 @@ def _endpoint_hint(*, node_id_missing: bool, service: ChannelService) -> str:
     if node_id_missing:
         return (
             "the node id could not be derived; check the gateway log and the "
-            f"state directory {service.key_store.path.parent} for key errors"
+            f"state directory {transport.default_state_dir()} for key errors"
         )
     return (
         "the endpoint is not connected; set "
@@ -164,11 +164,10 @@ def format_info(service: ChannelService) -> str:
             relay_text = "invalid configuration"
     lines.append(f"relay: {relay_text}")
     lines.append(f"allowlist entries: {len(service.allowlist.entries())}")
-    lines.append(f"state dir: {service.key_store.path.parent}")
+    lines.append(f"state dir: {transport.default_state_dir()}")
     if not running:
-        lines.append(
-            f"hint: {_endpoint_hint(node_id_missing=node_id is None, service=service)}"
-        )
+        hint = _endpoint_hint(node_id_missing=node_id is None)
+        lines.append(f"hint: {hint}")
     return "\n".join(lines)
 
 
@@ -185,6 +184,8 @@ async def handle_allow(service: ChannelService, args: str = "") -> str:
         normalized = await service.allowlist.add(parts[0])
     except ValueError as exc:
         return f"invalid node id: {exc}"
+    except OSError as exc:
+        return f"could not update allowlist: {type(exc).__name__}"
     return f"allowlisted: {normalized}"
 
 
@@ -273,12 +274,16 @@ def build_adapter_class(
             try:
                 server = await service.start()
             except Exception as exc:
+                detail = str(exc).strip()
+                reason = type(exc).__name__
+                if detail:
+                    reason = f"{reason}: {detail}"
                 logger.error(
                     "iroh channel failed to start (%s): see /iroh_info and "
                     "the gateway log; if the platform is disabled, set "
                     "gateway.platforms.iroh.enabled=true and restart the "
                     "gateway from a normal shell outside it",
-                    type(exc).__name__,
+                    reason,
                 )
                 return False
             self._server = server

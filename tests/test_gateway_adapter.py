@@ -303,11 +303,32 @@ async def test_connect_failure_logs_class_and_next_action(
 
     message = caplog.text
     assert "BindFailure" in message
+    assert "bind failed" in message
     assert "/iroh_info" in message
     assert "gateway.platforms.iroh.enabled=true" in message
     assert "outside" in message
     assert NODE_A not in message
     assert "allowlist" not in message.lower()
+
+
+async def test_connect_failure_log_names_invalid_relay_value(
+    tmp_path, monkeypatch, caplog
+):
+    adapter, service = make_adapter(tmp_path)
+    bad_value = "ftp://relay.example.com"
+
+    async def failing_start():
+        raise transport.RelayConfigError(
+            f"unsupported relay URL scheme: {bad_value!r}"
+        )
+
+    monkeypatch.setattr(service, "start", failing_start)
+
+    with caplog.at_level(logging.ERROR):
+        assert await adapter.connect() is False
+
+    assert "RelayConfigError" in caplog.text
+    assert bad_value in caplog.text
 
 
 async def test_disconnect_is_idempotent(tmp_path, monkeypatch):
@@ -563,7 +584,8 @@ def make_command_service(tmp_path) -> gateway_adapter.ChannelService:
     return service
 
 
-async def test_info_reports_node_id_and_unavailable_ticket(tmp_path):
+async def test_info_reports_node_id_and_unavailable_ticket(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_IROH_STATE_DIR", str(tmp_path))
     service = make_command_service(tmp_path)
 
     text = await gateway_adapter.handle_info(service)
@@ -639,6 +661,8 @@ async def test_info_survives_unreadable_key_and_still_reports_facts(
     tmp_path, caplog, monkeypatch
 ):
     monkeypatch.setattr(transport, "iroh_available", lambda: True)
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("HERMES_IROH_STATE_DIR", str(state_dir))
     key_path = tmp_path / "node.key"
     key_path.write_bytes(b"short")
     service = gateway_adapter.ChannelService(
@@ -654,10 +678,10 @@ async def test_info_survives_unreadable_key_and_still_reports_facts(
     assert "ticket: unavailable" in text
     assert "alpn: iroh-channel/1" in text
     assert "allowlist entries: 0" in text
-    assert f"state dir: {tmp_path}" in text
+    assert f"state dir: {state_dir}" in text.splitlines()
     assert "hint:" in text
     assert "could not be derived" in text
-    assert f"state directory {tmp_path}" in text
+    assert f"state directory {state_dir}" in text
     assert "KeyStoreError" in caplog.text
     assert key_path.read_bytes().hex() not in caplog.text
     assert NODE_A not in caplog.text
@@ -717,6 +741,20 @@ async def test_allow_rejects_invalid_node_ids(tmp_path, value):
     text = await gateway_adapter.handle_allow(service, value)
 
     assert text.startswith("invalid node id") or "usage" in text.lower()
+    assert not (tmp_path / "allowlist.json").exists()
+
+
+async def test_allow_reports_write_failure_without_raising(tmp_path, monkeypatch):
+    service = make_command_service(tmp_path)
+
+    def fail_write(*args, **kwargs):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(transport, "_write_file_atomic", fail_write)
+
+    text = await gateway_adapter.handle_allow(service, NODE_A)
+
+    assert text == "could not update allowlist: PermissionError"
     assert not (tmp_path / "allowlist.json").exists()
 
 

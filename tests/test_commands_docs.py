@@ -117,6 +117,20 @@ async def test_allow_invalid_message_matches_readme(tmp_path):
     assert "invalid node id: <reason>" in readme
 
 
+async def test_allow_write_failure_message_matches_readme(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(transport, "_write_file_atomic", fail_write)
+    text = await gateway_adapter.handle_allow(service, NODE_ID)
+    readme = README.read_text(encoding="utf-8")
+
+    assert text == "could not update allowlist: OSError"
+    assert "could not update allowlist: <error class>" in readme
+
+
 def test_readme_documents_all_delivery_limitations():
     readme = README.read_text(encoding="utf-8")
 

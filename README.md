@@ -22,8 +22,7 @@ This repository is the plugin directory: install it with
 | `tests/` | Unit and loopback integration tests |
 
 `transport.py` has no Hermes imports, so the protocol layer can be exercised in a
-plain Python environment. Hermes imports live inside
-`gateway_adapter.register()` and the adapter factory.
+plain Python environment. Hermes imports live inside `gateway_adapter.register()`.
 
 ## Installation
 
@@ -371,7 +370,7 @@ Different session ids, or different node ids, run concurrently.
 | `timeout` | The prompt did not arrive within 30 s, or the turn produced no terminal frame within the turn timeout |
 | `unauthorized` | Reserved for authorization failures; unauthorized connections are closed before a stream exists |
 | `internal_error` | Unclassified failure; no internal detail is sent |
-| `too_many_streams` | A connection or total stream limit was reached |
+| `too_many_streams` | The per-connection or total stream limit was reached |
 
 ### Close behavior
 
@@ -483,7 +482,8 @@ hint: the endpoint is not connected; set gateway.platforms.iroh.enabled=true and
 - `ticket` is the dial string only while the endpoint is running.
 - `endpoint` is `running` after the platform connects and `not running` before
   the gateway restart or when the `iroh` package is missing.
-- `relay` shows `default`, `disabled`, or the configured URL list.
+- `relay` shows `default`, `disabled`, the configured URL list, or
+  `invalid configuration` when the setting cannot be parsed.
 - `allowlist entries` counts the effective union of the file and the environment.
 - `hint` appears only while the endpoint is not running. It names the missing
   SDK and the re-enable step, an unreadable key and the state directory, or the
@@ -501,8 +501,10 @@ normalized id:
 
 With no argument or with extra arguments it returns
 `usage: /iroh_allow <client_node_id>` and changes nothing. An invalid value
-returns `invalid node id: <reason>` and changes nothing. Additions take effect
-for the next connection without a restart.
+returns `invalid node id: <reason>` and changes nothing. If the allowlist file
+cannot be written, it returns `could not update allowlist: <error class>` and
+changes nothing. Additions take effect for the next connection without a
+restart.
 
 ## Delivery behavior and limitations
 
