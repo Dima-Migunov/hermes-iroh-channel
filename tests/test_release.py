@@ -102,9 +102,9 @@ def test_ensure_metadata_reports_mismatch(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     ("remote", "expected"),
     [
-        ("git@github.com:Dima-Migunov/iroh-channel.git", "Dima-Migunov/iroh-channel"),
-        ("https://github.com/Dima-Migunov/iroh-channel.git", "Dima-Migunov/iroh-channel"),
-        ("https://github.com/Dima-Migunov/iroh-channel", "Dima-Migunov/iroh-channel"),
+        ("git@github.com:Dima-Migunov/hermes-iroh-channel.git", "Dima-Migunov/hermes-iroh-channel"),
+        ("https://github.com/Dima-Migunov/hermes-iroh-channel.git", "Dima-Migunov/hermes-iroh-channel"),
+        ("https://github.com/Dima-Migunov/hermes-iroh-channel", "Dima-Migunov/hermes-iroh-channel"),
     ],
 )
 def test_parse_repo_slug(remote, expected):

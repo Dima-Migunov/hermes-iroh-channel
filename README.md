@@ -7,7 +7,7 @@ over QUIC bidirectional streams. No inbound port, no platform account, and no
 relay account are required to run the plugin.
 
 This repository is the plugin directory: install it with
-`hermes plugins install Dima-Migunov/iroh-channel`.
+`hermes plugins install Dima-Migunov/hermes-iroh-channel`.
 
 ## Layout
 
@@ -28,7 +28,7 @@ plain Python environment. Hermes imports live inside `gateway_adapter.register()
 
 ```bash
 # from GitHub
-hermes plugins install Dima-Migunov/iroh-channel
+hermes plugins install Dima-Migunov/hermes-iroh-channel
 ```
 
 The install clones the repository into `~/.hermes/plugins/iroh-channel/` and
@@ -128,7 +128,7 @@ take effect for the next connection without a restart. See
 For a reproducible install, pin the commit:
 
 ```bash
-hermes plugins install Dima-Migunov/iroh-channel --ref <40-character-commit-sha>
+hermes plugins install Dima-Migunov/hermes-iroh-channel --ref <40-character-commit-sha>
 ```
 
 To work from a local checkout instead, copy the directory into
