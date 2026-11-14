@@ -532,7 +532,7 @@ async def test_notice_send_does_not_finalize_the_stream(tmp_path):
             break
         await asyncio.sleep(0.01)
 
-    await adapter.send(chat_id, "setup notice")
+    await adapter.send(chat_id, "setup notice", metadata={"_interim_send": True})
     assert server.session_for(chat_id) is not None
 
     await adapter.send(chat_id, "answer", metadata={"notify": True})

@@ -313,7 +313,7 @@ def build_adapter_class(
             finalize = bool(meta.get("notify") or meta.get("final"))
             if meta.get("_interim_send"):
                 finalize = False
-            elif not finalize and not meta.get("expect_edits") and session.slash_prompt:
+            elif not finalize and not meta.get("expect_edits"):
                 finalize = True
             await deliver_message(service, session, content, finalize=finalize)
             return send_result(success=True, message_id=session.chat_id)
