@@ -48,6 +48,65 @@ def test_bump_version_rejects_unknown_part():
         release.bump_version("1.0.0", "banana")
 
 
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ("fix: keep the stream open\x1f", "patch"),
+        ("chore: tidy the tests\x1f", "patch"),
+        ("plain subject without a type\x1f", "patch"),
+        ("feat: add auto releases\x1f", "minor"),
+        ("feat(release): add auto releases\x1f", "minor"),
+        ("feat!: change the wire format\x1f", "major"),
+        ("fix: adjust\x1f\nBREAKING CHANGE: new ALPN", "major"),
+        ("chore: release v1.0.1\x1f", None),
+        ("\x1f", None),
+    ],
+)
+def test_parse_commit_part(entry, expected):
+    assert release.parse_commit_part(entry) == expected
+
+
+@pytest.mark.parametrize(
+    ("entries", "expected"),
+    [
+        (["fix: a\x1f", "docs: b\x1f"], "patch"),
+        (["fix: a\x1f", "feat: b\x1f"], "minor"),
+        (["feat: a\x1f", "fix!: b\x1f"], "major"),
+    ],
+)
+def test_release_part_for_takes_the_highest_part(entries, expected):
+    assert release.release_part_for(entries) == expected
+
+
+def test_release_part_for_rejects_empty_history():
+    with pytest.raises(release.ReleaseError):
+        release.release_part_for(["chore: release v1.0.1\x1f"])
+
+
+def test_commits_since_uses_the_tag_range(monkeypatch):
+    calls = []
+
+    def fake_git(*args):
+        calls.append(args)
+        return "fix: a\x1f\x1e"
+
+    monkeypatch.setattr(release, "git", fake_git)
+
+    entries = release.commits_since("v1.0.0")
+
+    assert entries == ["fix: a\x1f"]
+    assert calls[0][-1] == "v1.0.0..HEAD"
+
+
+def test_last_release_tag_returns_none_without_tags(monkeypatch):
+    def fake_git(*args):
+        raise release.ReleaseError("no tags")
+
+    monkeypatch.setattr(release, "git", fake_git)
+
+    assert release.last_release_tag() is None
+
+
 def test_update_versions_rewrites_both_files(tmp_path):
     (tmp_path / "pyproject.toml").write_text(
         '[project]\nname = "iroh-channel"\nversion = "1.2.3"\n'

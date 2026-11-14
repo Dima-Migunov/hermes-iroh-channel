@@ -524,24 +524,38 @@ restart.
 
 ## Releasing
 
-Releases are cut from a clean `main` that matches `origin/main`:
+Every push to `main` cuts a release automatically. The `release` workflow
+derives the version part from the commits since the last tag, bumps
+`pyproject.toml` and `plugin.yaml`, runs `python3 -m pytest -q`, commits
+`chore: release vX.Y.Z`, creates an annotated tag, pushes `main` and the tag
+atomically, and publishes the GitHub release. Clients see a new version on every
+push.
+
+| Commits since the last tag | Part |
+| --- | --- |
+| `feat!:` or a `BREAKING CHANGE:` footer | `major` |
+| any `feat:` | `minor` |
+| anything else | `patch` |
+
+The same script runs locally and is the escape hatch when a release must be
+forced:
 
 ```bash
-scripts/release.sh patch --dry-run   # show the plan, change nothing
-scripts/release.sh patch             # 1.0.0 -> 1.0.1
+scripts/release.sh --dry-run          # show the derived plan, change nothing
+scripts/release.sh patch              # 1.0.0 -> 1.0.1, ignores the commits
+scripts/release.sh minor --notes "..."
 ```
 
-The script reads the version from `pyproject.toml`, requires it to match
-`plugin.yaml`, computes the next `patch`, `minor`, or `major` version, and runs
-`python3 -m pytest -q`. It then bumps both files, commits
-`chore: release vX.Y.Z`, creates an annotated tag, pushes `main` and the tag
-atomically, and publishes the GitHub release.
+It refuses to run unless the working tree is clean, the branch is `main`, local
+`main` matches `origin/main`, and the two metadata files already agree on the
+current version. Override notes with `--notes "..."` or `--notes-file NOTES.md`;
+use `--repo owner/name` when `origin` is not the GitHub repository that should
+receive the release. The GitHub API call needs `GITHUB_TOKEN` in the environment
+or in `.env` with permission to create releases; the workflow uses its built-in
+token. A dry run does not need it.
 
-Release notes default to the commit subjects since the previous tag. Override
-them with `--notes "..."` or `--notes-file NOTES.md`; use `--repo owner/name`
-when `origin` is not the GitHub repository that should receive the release.
-The GitHub API call needs `GITHUB_TOKEN` in the environment or in `.env` with
-permission to create releases. A dry run does not need it.
+The `release` workflow can also be started from the Actions tab with an explicit
+part.
 
 If the script stops after pushing, the commit and tag are already on the
 remote; create the release for that tag in the GitHub UI.

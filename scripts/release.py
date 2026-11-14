@@ -24,6 +24,12 @@ SEMVER = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 PYPROJECT_VERSION = re.compile(r'(?m)^version\s*=\s*"([^"]+)"\s*$')
 PLUGIN_VERSION = re.compile(r"(?m)^version\s*:\s*([^\s#]+)\s*$")
 GITHUB_REMOTE = re.compile(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$")
+CONVENTIONAL_SUBJECT = re.compile(
+    r"^(?P<type>[a-zA-Z]+)(?:\([^)]*\))?(?P<breaking>!)?: "
+)
+BREAKING_FOOTER = re.compile(r"(?m)^BREAKING[ -]CHANGE:")
+RELEASE_SUBJECT = re.compile(r"^chore: release v\d+\.\d+\.\d+$")
+PART_ORDER = ("patch", "minor", "major")
 
 
 class ReleaseError(Exception):
@@ -58,6 +64,43 @@ def bump_version(current: str, part: str) -> str:
     if part == "patch":
         return f"{major}.{minor}.{patch + 1}"
     raise ReleaseError(f"unknown release part: {part}")
+
+
+def parse_commit_part(entry: str) -> str | None:
+    subject, _, body = entry.partition("\x1f")
+    subject = subject.strip()
+    if not subject or RELEASE_SUBJECT.match(subject):
+        return None
+    match = CONVENTIONAL_SUBJECT.match(subject)
+    if (match and match.group("breaking")) or BREAKING_FOOTER.search(body):
+        return "major"
+    if match and match.group("type") == "feat":
+        return "minor"
+    return "patch"
+
+
+def release_part_for(entries: list[str]) -> str:
+    parts = [part for part in map(parse_commit_part, entries) if part]
+    if not parts:
+        raise ReleaseError("no commits to release since the last tag")
+    return max(parts, key=PART_ORDER.index)
+
+
+def commits_since(tag: str | None) -> list[str]:
+    revision_range = f"{tag}..HEAD" if tag else "HEAD"
+    raw = git("log", "--pretty=format:%s%x1f%b%x1e", revision_range)
+    return [entry for entry in raw.split("\x1e") if entry.strip()]
+
+
+def last_release_tag() -> str | None:
+    try:
+        return git("describe", "--tags", "--abbrev=0", "--match", "v[0-9]*")
+    except ReleaseError:
+        return None
+
+
+def auto_part() -> str:
+    return release_part_for(commits_since(last_release_tag()))
 
 
 def read_versions(root: Path | None = None) -> tuple[str, str]:
@@ -246,8 +289,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "part",
-        choices=("patch", "minor", "major"),
-        help="which semantic version component to increment",
+        nargs="?",
+        default="auto",
+        choices=("auto", "patch", "minor", "major"),
+        help=(
+            "which semantic version component to increment; auto derives it "
+            "from the commits since the last release tag (default)"
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -266,7 +314,8 @@ def main(argv: list[str] | None = None) -> int:
 
     require_clean_main()
     current_version = ensure_metadata_in_sync()
-    new_version = bump_version(current_version, args.part)
+    part = auto_part() if args.part == "auto" else args.part
+    new_version = bump_version(current_version, part)
     tag = f"v{new_version}"
     if tag_exists(tag):
         raise ReleaseError(f"tag {tag} already exists")
@@ -274,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     slug = args.repo or repo_slug()
 
     print(f"current version: {current_version}")
+    print(f"release part:    {part}")
     print(f"next version:    {new_version}")
     print(f"tag:             {tag}")
     print(f"release:         {slug} {tag}")
