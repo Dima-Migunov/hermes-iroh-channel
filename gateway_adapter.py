@@ -310,9 +310,11 @@ def build_adapter_class(
             if session is None:
                 return _no_active_stream_result(send_result)
             meta = metadata or {}
-            finalize = bool(meta.get("notify") or meta.get("final")) or (
-                not meta.get("expect_edits")
-            )
+            finalize = bool(meta.get("notify") or meta.get("final"))
+            if meta.get("_interim_send"):
+                finalize = False
+            elif not finalize and not meta.get("expect_edits") and session.slash_prompt:
+                finalize = True
             await deliver_message(service, session, content, finalize=finalize)
             return send_result(success=True, message_id=session.chat_id)
 

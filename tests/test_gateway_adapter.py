@@ -451,6 +451,146 @@ async def test_turn_timeout_produces_error_frame(tmp_path):
     assert server._sessions == {}
 
 
+async def test_response_is_delivered_after_handler_returns(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session_id = "conv-async"
+    chat_id = transport.make_chat_id(NODE_A, session_id)
+    send = FakeSend()
+
+    server = transport.ChannelServer(
+        key_store=service.key_store,
+        allowlist=service.allowlist,
+        turn_timeout=5.0,
+        prompt_handler=gateway_adapter.build_prompt_handler(
+            service, adapter, FakeEvent
+        ),
+    )
+    adapter._server = server
+
+    class FakeRecv:
+        async def read(self, size_limit):
+            return json.dumps(
+                {"type": "prompt", "session_id": session_id, "text": "hi"}
+            ).encode() + b"\n"
+
+    class FakeBi:
+        def recv(self):
+            return FakeRecv()
+
+        def send(self):
+            return send
+
+    serving = asyncio.create_task(server._serve_stream(FakeBi(), NODE_A))
+    for _ in range(100):
+        if adapter.submitted:
+            break
+        await asyncio.sleep(0.01)
+
+    assert adapter.submitted
+    assert server.session_for(chat_id) is not None
+
+    result = await adapter.send(chat_id, "reply", metadata={"notify": True})
+    assert result.success is True
+    await asyncio.wait_for(serving, timeout=2)
+
+    assert [frame["type"] for frame in send.frames()] == ["start", "delta", "done"]
+    assert server._sessions == {}
+
+
+async def test_notice_send_does_not_finalize_the_stream(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session_id = "conv-notice"
+    chat_id = transport.make_chat_id(NODE_A, session_id)
+    send = FakeSend()
+
+    server = transport.ChannelServer(
+        key_store=service.key_store,
+        allowlist=service.allowlist,
+        turn_timeout=5.0,
+        prompt_handler=gateway_adapter.build_prompt_handler(
+            service, adapter, FakeEvent
+        ),
+    )
+    adapter._server = server
+
+    class FakeRecv:
+        async def read(self, size_limit):
+            return json.dumps(
+                {"type": "prompt", "session_id": session_id, "text": "hi"}
+            ).encode() + b"\n"
+
+    class FakeBi:
+        def recv(self):
+            return FakeRecv()
+
+        def send(self):
+            return send
+
+    serving = asyncio.create_task(server._serve_stream(FakeBi(), NODE_A))
+    for _ in range(100):
+        if adapter.submitted:
+            break
+        await asyncio.sleep(0.01)
+
+    await adapter.send(chat_id, "setup notice")
+    assert server.session_for(chat_id) is not None
+
+    await adapter.send(chat_id, "answer", metadata={"notify": True})
+    await asyncio.wait_for(serving, timeout=2)
+
+    assert [frame["type"] for frame in send.frames()] == [
+        "start",
+        "delta",
+        "delta",
+        "done",
+    ]
+    assert send.frames()[1]["content"] == "setup notice"
+    assert send.frames()[2]["content"] == "\n\nanswer"
+    assert server._sessions == {}
+
+
+async def test_slash_command_reply_finalizes_without_notify(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session_id = "conv-command"
+    chat_id = transport.make_chat_id(NODE_A, session_id)
+    send = FakeSend()
+
+    server = transport.ChannelServer(
+        key_store=service.key_store,
+        allowlist=service.allowlist,
+        turn_timeout=5.0,
+        prompt_handler=gateway_adapter.build_prompt_handler(
+            service, adapter, FakeEvent
+        ),
+    )
+    adapter._server = server
+
+    class FakeRecv:
+        async def read(self, size_limit):
+            return json.dumps(
+                {"type": "prompt", "session_id": session_id, "text": "/help"}
+            ).encode() + b"\n"
+
+    class FakeBi:
+        def recv(self):
+            return FakeRecv()
+
+        def send(self):
+            return send
+
+    serving = asyncio.create_task(server._serve_stream(FakeBi(), NODE_A))
+    for _ in range(100):
+        if adapter.submitted:
+            break
+        await asyncio.sleep(0.01)
+
+    await adapter.send(chat_id, "command reply")
+    await asyncio.wait_for(serving, timeout=2)
+
+    assert [frame["type"] for frame in send.frames()] == ["start", "delta", "done"]
+    assert server._sessions == {}
+
+
 # --------------------------------------------------------------------------- #
 # send / edit_message mapping
 # --------------------------------------------------------------------------- #
@@ -489,7 +629,9 @@ async def test_non_streamed_single_send_is_terminal(tmp_path):
     session, send = make_session(tmp_path)
     await register_session(adapter, service, session)
 
-    result = await adapter.send(session.chat_id, "single reply")
+    result = await adapter.send(
+        session.chat_id, "single reply", metadata={"notify": True}
+    )
 
     assert result.success is True
     assert send.frames() == [
