@@ -32,13 +32,27 @@ plain Python environment. Hermes imports live inside
 hermes plugins install Dima-Migunov/iroh-channel
 ```
 
-The install clones the repository into `~/.hermes/plugins/iroh-channel/`.
-Install leaves the plugin disabled, and asks `Enable 'iroh-channel' now? [y/N]`;
-Answering no is the default. Enabling is a separate, explicit step:
+The install clones the repository into `~/.hermes/plugins/iroh-channel/` and
+leaves the plugin disabled. It asks `Enable 'iroh-channel' now? [y/N]`; answering
+no is the default, so enabling is a separate, explicit step.
+
+### 1. Enable the plugin and the platform
+
+The helper is the supported terminal path:
+
+```bash
+scripts/enable.sh
+```
+
+It enables `iroh-channel`, sets `gateway.platforms.iroh.enabled=true`, verifies
+the result with `hermes plugins list`, and prints the restart command for the
+detected host. Re-running it is safe, and it never runs `pip install`.
+
+Manual equivalent:
 
 ```bash
 hermes plugins enable iroh-channel
-hermes gateway restart
+hermes config set gateway.platforms.iroh.enabled true
 ```
 
 `hermes plugins enable` is also the step that prepares the plugin's Python
@@ -48,15 +62,69 @@ yourself — a manually installed package is not part of that managed
 environment and is not retained when Hermes rebuilds it.
 
 Enabling the plugin loads `register()`. The endpoint itself binds when the
-gateway connects the `iroh` platform, which is a second switch:
-
-```bash
-hermes config set gateway.platforms.iroh.enabled true
-hermes gateway restart
-```
-
+gateway connects the `iroh` platform, which is the second switch above.
 Without the `iroh` package the plugin still loads, but reports the platform as
 unavailable with an install hint and starts no endpoint.
+
+#### Terminal helper
+
+`scripts/enable.sh` is the supported terminal path. It does not restart the
+gateway by default. `--restart` performs the restart and is only for a human
+running the helper from a normal shell outside the gateway: restarting from
+inside kills the agent session that invoked it. `scripts/enable.sh --help`
+lists the options.
+
+### 2. Restart the gateway from outside it
+
+Platform plugins load only when the gateway starts. The agent runs inside the
+gateway process, so it cannot restart that process; Hermes refuses with
+`gateway_lifecycle_block`, and that refusal is expected. One human or host
+action performs the restart:
+
+| Host | Restart path |
+| --- | --- |
+| Local Hermes Desktop | Quit and reopen the app, or use its restart control |
+| Web host with controls | Use the host panel's restart or stop/start control |
+| CLI or systemd | From a shell outside the gateway: `systemctl --user restart hermes-gateway.service` (fallback `hermes gateway restart`) |
+| Remote Desktop client | The client cannot restart a gateway on another host; the host operator or host panel must do it |
+
+The helper prints the command for the detected host. It does not run it unless
+a human passes `--restart` outside the gateway.
+
+### 3. Check `/iroh_info`
+
+```text
+/iroh_info
+```
+
+When the endpoint is running, the output contains `endpoint: running` and a
+dial ticket. While it says `endpoint: not running` and `ticket: unavailable`, a
+`hint:` line names the next step. See [Slash commands](#slash-commands) for the
+full output.
+
+### 4. Send the ticket
+
+Send the ticket to the client application. The node id identifies this agent;
+the ticket is the dial string.
+
+### 5. Authorize the client
+
+```text
+/iroh_allow <client_node_id>
+```
+
+The client's node id must be in the allowlist before it can connect. Additions
+take effect for the next connection without a restart. See
+[`/iroh_allow`](#iroh_allow-client_node_id).
+
+### Troubleshooting installation
+
+| Symptom | Cause | Action |
+| --- | --- | --- |
+| `gateway_lifecycle_block` | Expected: the agent is inside the gateway | Use the human or host restart step; do not retry the command from the session |
+| `endpoint: not running` / `ticket: unavailable` | Platform disabled or the gateway has not restarted | Run `scripts/enable.sh`, then restart outside the gateway |
+| `hint:` names the missing SDK | `iroh` is not importable | `hermes plugins enable iroh-channel`, accept the dependency prompt, restart |
+| Client connects and is closed immediately | Node id not allowlisted | Run `/iroh_allow <node_id>` and reconnect |
 
 For a reproducible install, pin the commit:
 
@@ -388,23 +456,38 @@ to the dispatcher; they never print and never raise into it.
 
 ### `/iroh_info`
 
-Returns one labeled line per fact:
+Returns one labeled line per fact. A running endpoint:
 
 ```text
 node id: 3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29
 ticket: endpointabc123...
+endpoint: running
 alpn: iroh-channel/1
 relay: default
 allowlist entries: 2
 state dir: /home/you/.hermes/plugins/iroh-channel
 ```
 
-- `node id` is always present; it is derived from the stored key, so it works
-  before the endpoint binds.
-- `ticket` is `unavailable` when the endpoint is not running, and the dial
-  string otherwise.
+When the endpoint is not running, `ticket` is `unavailable` and one `hint:`
+line at the end names the next step:
+
+```text
+ticket: unavailable
+endpoint: not running
+hint: the endpoint is not connected; set gateway.platforms.iroh.enabled=true and restart the gateway from a normal shell outside it, then check /iroh_info again
+```
+
+- `node id` is derived from the stored key, so it works before the endpoint
+  binds. If the key cannot be read, it prints `node id: unavailable`, logs the
+  exception class, and still returns the other facts.
+- `ticket` is the dial string only while the endpoint is running.
+- `endpoint` is `running` after the platform connects and `not running` before
+  the gateway restart or when the `iroh` package is missing.
 - `relay` shows `default`, `disabled`, or the configured URL list.
 - `allowlist entries` counts the effective union of the file and the environment.
+- `hint` appears only while the endpoint is not running. It names the missing
+  SDK and the re-enable step, an unreadable key and the state directory, or the
+  platform flag and the outside-the-gateway restart, in that order.
 
 ### `/iroh_allow <client_node_id>`
 

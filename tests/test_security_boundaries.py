@@ -119,6 +119,8 @@ def test_info_output_does_not_leak_key_material(tmp_path, monkeypatch):
     assert NODE_A not in info
     assert "node id:" in info
     assert "ticket: unavailable" in info
+    assert "endpoint: not running" in info
+    assert "hint:" in info
     gateway_adapter.ChannelService.reset()
 
 

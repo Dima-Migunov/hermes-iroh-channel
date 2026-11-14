@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -282,6 +283,31 @@ async def test_connect_returns_false_when_start_fails(tmp_path, monkeypatch):
 
     assert await adapter.connect() is False
     assert adapter.connected is False
+
+
+async def test_connect_failure_logs_class_and_next_action(
+    tmp_path, monkeypatch, caplog
+):
+    adapter, service = make_adapter(tmp_path)
+
+    class BindFailure(Exception):
+        pass
+
+    async def failing_start():
+        raise BindFailure("bind failed")
+
+    monkeypatch.setattr(service, "start", failing_start)
+
+    with caplog.at_level(logging.ERROR):
+        assert await adapter.connect() is False
+
+    message = caplog.text
+    assert "BindFailure" in message
+    assert "/iroh_info" in message
+    assert "gateway.platforms.iroh.enabled=true" in message
+    assert "outside" in message
+    assert NODE_A not in message
+    assert "allowlist" not in message.lower()
 
 
 async def test_disconnect_is_idempotent(tmp_path, monkeypatch):
@@ -565,6 +591,78 @@ async def test_info_reports_ticket_when_running(tmp_path):
     assert "relay: disabled" in text
 
 
+async def test_info_reports_endpoint_stopped_with_next_step_hint(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(transport, "iroh_available", lambda: True)
+    service = make_command_service(tmp_path)
+
+    text = await gateway_adapter.handle_info(service)
+
+    assert "endpoint: not running" in text
+    assert "ticket: unavailable" in text
+    assert "hint:" in text
+    assert "gateway.platforms.iroh.enabled=true" in text
+    assert "outside" in text
+    assert text.splitlines()[-1].startswith("hint: ")
+
+
+async def test_info_reports_endpoint_running_without_hint(tmp_path):
+    service = make_command_service(tmp_path)
+
+    class StubServer:
+        running = True
+        ticket = "endpointabc123"
+        relay = transport.parse_relay_setting("disabled")
+
+    service.server = StubServer()
+
+    text = await gateway_adapter.handle_info(service)
+
+    assert "endpoint: running" in text
+    assert "hint:" not in text
+
+
+async def test_info_sdk_missing_hint_prefers_reinstall(tmp_path, monkeypatch):
+    monkeypatch.setattr(transport, "iroh_available", lambda: False)
+    service = make_command_service(tmp_path)
+
+    text = await gateway_adapter.handle_info(service)
+
+    assert "endpoint: not running" in text
+    assert "not importable" in text
+    assert "hermes plugins enable iroh-channel" in text
+    assert "restart the gateway" not in text
+
+
+async def test_info_survives_unreadable_key_and_still_reports_facts(
+    tmp_path, caplog, monkeypatch
+):
+    monkeypatch.setattr(transport, "iroh_available", lambda: True)
+    key_path = tmp_path / "node.key"
+    key_path.write_bytes(b"short")
+    service = gateway_adapter.ChannelService(
+        key_store=transport.NodeKeyStore(path=key_path, backend=FakeBackend()),
+        allowlist=FakeAllowlist(path=tmp_path / "allowlist.json"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        text = gateway_adapter.format_info(service)
+
+    assert "node id: unavailable" in text
+    assert "endpoint: not running" in text
+    assert "ticket: unavailable" in text
+    assert "alpn: iroh-channel/1" in text
+    assert "allowlist entries: 0" in text
+    assert f"state dir: {tmp_path}" in text
+    assert "hint:" in text
+    assert "could not be derived" in text
+    assert f"state directory {tmp_path}" in text
+    assert "KeyStoreError" in caplog.text
+    assert key_path.read_bytes().hex() not in caplog.text
+    assert NODE_A not in caplog.text
+
+
 async def test_info_reports_relay_from_environment(tmp_path, monkeypatch):
     service = make_command_service(tmp_path)
     monkeypatch.setenv("HERMES_IROH_RELAY", "https://relay.example.com")
@@ -685,6 +783,43 @@ def fake_hermes(monkeypatch):
         yield modules
     finally:
         _FAKE_PLATFORM_NAMES.clear()
+
+
+def test_register_warns_once_when_iroh_sdk_is_missing(
+    fake_hermes, monkeypatch, caplog
+):
+    monkeypatch.setattr(transport, "iroh_available", lambda: False)
+    ctx = FakeContext()
+
+    with caplog.at_level(logging.WARNING):
+        gateway_adapter.register(ctx)
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == gateway_adapter.__name__
+        and "iroh SDK is not importable" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "hermes plugins enable iroh-channel" in warnings[0]
+    assert "iroh>=1.2,<2" in warnings[0]
+    gateway_adapter.ChannelService.reset()
+
+
+def test_register_is_quiet_when_iroh_sdk_is_available(
+    fake_hermes, monkeypatch, caplog
+):
+    monkeypatch.setattr(transport, "iroh_available", lambda: True)
+    ctx = FakeContext()
+
+    with caplog.at_level(logging.WARNING):
+        gateway_adapter.register(ctx)
+
+    assert not any(
+        "iroh SDK is not importable" in record.getMessage()
+        for record in caplog.records
+    )
+    gateway_adapter.ChannelService.reset()
 
 
 def test_register_records_one_platform(fake_hermes):

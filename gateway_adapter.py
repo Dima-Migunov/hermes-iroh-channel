@@ -118,10 +118,40 @@ class ChannelService:
         return self.server.ticket
 
 
+def _endpoint_hint(*, node_id_missing: bool, service: ChannelService) -> str:
+    if not transport.iroh_available():
+        return (
+            "the iroh Python package is not importable; run "
+            "hermes plugins enable iroh-channel to install iroh>=1.2,<2 and "
+            "accept the dependency prompt"
+        )
+    if node_id_missing:
+        return (
+            "the node id could not be derived; check the gateway log and the "
+            f"state directory {service.key_store.path.parent} for key errors"
+        )
+    return (
+        "the endpoint is not connected; set "
+        "gateway.platforms.iroh.enabled=true and restart the gateway from a "
+        "normal shell outside it, then check /iroh_info again"
+    )
+
+
 def format_info(service: ChannelService) -> str:
-    lines = [f"node id: {service.node_id()}"]
-    ticket = service.ticket()
+    running = service.server is not None and service.server.running
+    try:
+        node_id: Optional[str] = service.node_id()
+    except Exception as exc:
+        node_id = None
+        logger.warning(
+            "iroh node id unavailable: %s (check the gateway log and the "
+            "state directory for key errors)",
+            type(exc).__name__,
+        )
+    lines = [f"node id: {node_id if node_id else 'unavailable'}"]
+    ticket = service.ticket() if running else None
     lines.append(f"ticket: {ticket if ticket else 'unavailable'}")
+    lines.append(f"endpoint: {'running' if running else 'not running'}")
     lines.append(f"alpn: {transport.ALPN.decode()}")
     if service.server is not None and service.server.relay is not None:
         relay_text = service.server.relay.describe()
@@ -135,6 +165,10 @@ def format_info(service: ChannelService) -> str:
     lines.append(f"relay: {relay_text}")
     lines.append(f"allowlist entries: {len(service.allowlist.entries())}")
     lines.append(f"state dir: {service.key_store.path.parent}")
+    if not running:
+        lines.append(
+            f"hint: {_endpoint_hint(node_id_missing=node_id is None, service=service)}"
+        )
     return "\n".join(lines)
 
 
@@ -240,7 +274,11 @@ def build_adapter_class(
                 server = await service.start()
             except Exception as exc:
                 logger.error(
-                    "iroh channel failed to start: %s", type(exc).__name__
+                    "iroh channel failed to start (%s): see /iroh_info and "
+                    "the gateway log; if the platform is disabled, set "
+                    "gateway.platforms.iroh.enabled=true and restart the "
+                    "gateway from a normal shell outside it",
+                    type(exc).__name__,
                 )
                 return False
             self._server = server
@@ -316,6 +354,13 @@ def register(ctx: Any) -> None:
     from gateway.config import Platform
     from gateway.platforms.base import BasePlatformAdapter, SendResult
     from gateway.platforms.event import MessageEvent
+
+    if not transport.iroh_available():
+        logger.warning(
+            "iroh SDK is not importable; the iroh platform stays unavailable "
+            "until `hermes plugins enable iroh-channel` installs "
+            "iroh>=1.2,<2 and the gateway is restarted"
+        )
 
     service = ChannelService.get()
 

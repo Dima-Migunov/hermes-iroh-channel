@@ -106,3 +106,29 @@ def test_after_install_covers_switches_and_authorization():
     assert f"platforms.{PLATFORM_NAME}.enabled" in text
     assert "/iroh_info" in text
     assert "/iroh_allow" in text
+
+
+def test_install_docs_name_the_terminal_helper():
+    for name in ("README.md", "after-install.md"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+
+        assert "scripts/enable.sh" in text, f"{name} omits the helper"
+        assert "--restart" in text, f"{name} omits the restart opt-in"
+        assert "does not restart" in text.lower(), f"{name} omits the default"
+
+
+def test_install_docs_share_the_restart_handoff():
+    for name in ("README.md", "after-install.md"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+
+        assert "outside the gateway" in text, f"{name} omits the restart boundary"
+        assert "gateway_lifecycle_block" in text, f"{name} omits the guard"
+        assert (
+            "human or host restart step" in text
+        ), f"{name} does not hand the guard refusal to a human or host"
+        assert (
+            "Quit and reopen" in text
+        ), f"{name} omits the no-terminal Desktop path"
+        assert (
+            "Remote Desktop" in text and "another host" in text
+        ), f"{name} omits the remote-host limitation"

@@ -55,6 +55,13 @@ def make_service(tmp_path):
 
 async def test_info_output_labels_match_readme(tmp_path):
     service = make_service(tmp_path)
+
+    class StubServer:
+        running = True
+        ticket = "endpointabc123..."
+        relay = transport.parse_relay_setting("")
+
+    service.server = StubServer()
     text = await gateway_adapter.handle_info(service)
     readme = README.read_text(encoding="utf-8")
 
@@ -62,6 +69,7 @@ async def test_info_output_labels_match_readme(tmp_path):
     assert labels == [
         "node id",
         "ticket",
+        "endpoint",
         "alpn",
         "relay",
         "allowlist entries",
@@ -69,6 +77,17 @@ async def test_info_output_labels_match_readme(tmp_path):
     ]
     for label in labels:
         assert f"{label}:" in readme
+
+
+async def test_info_hint_is_documented_with_the_other_labels(tmp_path):
+    service = make_service(tmp_path)
+    text = await gateway_adapter.handle_info(service)
+    readme = README.read_text(encoding="utf-8")
+
+    assert "endpoint: not running" in text
+    assert text.splitlines()[-1].startswith("hint: ")
+    assert "endpoint: not running" in readme
+    assert "hint:" in readme
 
 
 async def test_allow_confirmation_matches_readme(tmp_path):
