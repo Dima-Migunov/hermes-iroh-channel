@@ -71,7 +71,7 @@ class GatewayResponder:
         self.events.append(event)
         chat_id = event.source.chat_id
         if not self.streamed:
-            await self.adapter.send(chat_id, self.reply)
+            await self.adapter.send(chat_id, self.reply, metadata={"notify": True})
             return
         third = max(1, len(self.reply) // 3)
         preview = self.reply[:third]
@@ -374,7 +374,11 @@ async def test_two_sessions_get_isolated_replies(tmp_path):
     )
 
     async def responder(event) -> None:
-        await adapter.send(event.source.chat_id, f"reply:{event.source.chat_id}")
+        await adapter.send(
+            event.source.chat_id,
+            f"reply:{event.source.chat_id}",
+            metadata={"notify": True},
+        )
 
     adapter.handle_message = responder
     clients = {}

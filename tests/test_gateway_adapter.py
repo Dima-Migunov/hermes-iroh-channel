@@ -596,6 +596,32 @@ async def test_slash_command_reply_finalizes_without_notify(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+async def test_unmarked_progress_send_keeps_the_stream_open(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+
+    progress = await adapter.send(session.chat_id, "searching the web")
+    assert progress.success is True
+    assert [frame["type"] for frame in send.frames()] == ["start", "delta"]
+    assert session.terminal is False
+
+    final = await adapter.send(
+        session.chat_id, "the answer", metadata={"notify": True}
+    )
+    assert final.success is True
+    assert [frame["type"] for frame in send.frames()] == [
+        "start",
+        "delta",
+        "delta",
+        "done",
+    ]
+    assert "".join(
+        frame["content"] for frame in send.frames() if frame["type"] == "delta"
+    ) == "searching the web\n\nthe answer"
+    assert session.terminal is True
+
+
 async def test_streamed_preview_and_final_edit(tmp_path):
     adapter, service = make_adapter(tmp_path)
     session, send = make_session(tmp_path)
@@ -660,7 +686,7 @@ async def test_duplicate_finalization_writes_nothing_more(tmp_path):
     session, send = make_session(tmp_path)
     await register_session(adapter, service, session)
 
-    await adapter.send(session.chat_id, "answer")
+    await adapter.send(session.chat_id, "answer", metadata={"notify": True})
     await adapter.edit_message(
         session.chat_id, "m", "answer", finalize=True
     )

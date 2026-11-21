@@ -553,6 +553,7 @@ class StreamSession:
         self.finished = asyncio.Event()
         self.started = False
         self.terminal = False
+        self.slash_prompt = False
         self.cancelled = False
         self.deltas_sent = 0
         self.bytes_sent = 0
@@ -924,6 +925,7 @@ class ChannelServer:
             session_id=prompt.session_id,
             chat_id=chat_id,
         )
+        session.slash_prompt = prompt.text.lstrip().startswith("/")
         self._sessions[chat_id] = session
         try:
             await session.start()
