@@ -37,6 +37,56 @@ def test_exact_frame_bytes(frame, expected):
     assert transport.encode_frame(frame) == expected
 
 
+def test_done_frame_with_metadata_is_attached():
+    metadata = {"schema": 1, "latency_ms": 12}
+
+    frame = transport.done_frame(metadata)
+
+    assert frame == {"type": "done", "metadata": metadata}
+    assert transport.encode_frame(frame) == (
+        b'{"type":"done","metadata":{"schema":1,"latency_ms":12}}\n'
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        None,
+        {},
+        {"unserializable": object()},
+        {"infinite": float("inf")},
+        {"nan": float("nan")},
+    ],
+)
+def test_done_frame_omits_unusable_metadata(metadata):
+    assert transport.done_frame(metadata) == {"type": "done"}
+
+
+def test_done_frame_accepts_metadata_at_the_size_bound():
+    empty = {"blob": ""}
+    overhead = len(
+        json.dumps(
+            empty, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    )
+    metadata = {"blob": "x" * (transport.MAX_METADATA_BYTES - overhead)}
+    encoded = json.dumps(
+        metadata, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+
+    assert len(encoded) == transport.MAX_METADATA_BYTES
+    assert transport.done_frame(metadata) == {
+        "type": "done",
+        "metadata": metadata,
+    }
+
+
+def test_done_frame_drops_metadata_over_the_size_bound():
+    metadata = {"blob": "x" * transport.MAX_METADATA_BYTES}
+
+    assert transport.done_frame(metadata) == {"type": "done"}
+
+
 def test_error_constants_are_stable():
     assert transport.ERR_INVALID_PROMPT == "invalid_prompt"
     assert transport.ERR_PROMPT_TOO_LARGE == "prompt_too_large"

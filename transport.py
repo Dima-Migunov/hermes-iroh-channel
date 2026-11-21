@@ -30,6 +30,7 @@ DEFAULT_SESSION_ID = "default"
 
 MAX_PROMPT_BYTES = 64 * 1024
 MAX_DELTA_BYTES = 16 * 1024
+MAX_METADATA_BYTES = 4096
 PROMPT_READ_CHUNK = 4096
 
 PROMPT_TIMEOUT = 30.0
@@ -746,8 +747,25 @@ def delta_frame(content: str) -> dict:
     return {"type": "delta", "content": content}
 
 
-def done_frame() -> dict:
-    return {"type": "done"}
+def done_frame(metadata: Optional[dict] = None) -> dict:
+    if not metadata:
+        return {"type": "done"}
+    try:
+        encoded = json.dumps(
+            metadata, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        logger.debug("iroh done metadata is not JSON-encodable; omitting it")
+        return {"type": "done"}
+    if len(encoded) > MAX_METADATA_BYTES:
+        logger.debug(
+            "iroh done metadata is %d bytes, over the %d-byte limit; "
+            "omitting it",
+            len(encoded),
+            MAX_METADATA_BYTES,
+        )
+        return {"type": "done"}
+    return {"type": "done", "metadata": metadata}
 
 
 def error_frame(message: str) -> dict:
@@ -879,6 +897,7 @@ class StreamSession:
         self.cancelled = False
         self.deltas_sent = 0
         self.bytes_sent = 0
+        self.started_monotonic = time.monotonic()
 
     def _can_write(self) -> bool:
         return not self.terminal and not self.cancelled
@@ -912,11 +931,11 @@ class StreamSession:
             self.deltas_sent += 1
             self.bytes_sent += size
 
-    async def finish(self) -> None:
+    async def finish(self, metadata: Optional[dict] = None) -> None:
         if not self._can_write():
             return
         self.terminal = True
-        await self._write(done_frame(), terminal=True)
+        await self._write(done_frame(metadata), terminal=True)
         await self._close_send()
         self.finished.set()
 

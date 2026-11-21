@@ -356,7 +356,7 @@ for forward compatibility.
 | `prompt` | client → server | `type`: `"prompt"`, `text`: non-empty string, `session_id`: optional string |
 | `start` | server → client | `type`: `"start"`, `session_id`: the session id used |
 | `delta` | server → client | `type`: `"delta"`, `content`: string chunk of response text |
-| `done` | server → client | `type`: `"done"` |
+| `done` | server → client | `type`: `"done"`, `metadata`: optional object |
 | `error` | server → client | `type`: `"error"`, `message`: stable error value |
 
 Documented examples (each is one exact line ending with `\n`):
@@ -406,7 +406,50 @@ For every accepted prompt the server sends:
 No frame follows the terminal frame. The server finishes its send side after the
 terminal frame; the client observes end-of-stream.
 
-An empty agent response is `start` immediately followed by `done`.
+An empty agent response is `start` immediately followed by `done`. A successful
+`done` frame may also carry an optional `metadata` object; see
+[Response metadata](#response-metadata).
+
+### Response metadata
+
+A successful `done` frame may carry a `metadata` object describing the turn. It is
+optional: a client that only understands `type` still completes the response, and
+the frame is exactly `{"type":"done"}` when no metadata is available.
+
+```json
+{"type":"done","metadata":{"schema":1,"generated_at":"2026-11-21T12:00:00.000Z","latency_ms":812,"model":"gpt-5.1","provider":"openai","usage":{"input_tokens":1200,"output_tokens":300,"total_tokens":1500},"session_usage":{"input_tokens":10200,"output_tokens":2400,"total_tokens":12600,"api_calls":8,"context_tokens":8400,"context_length":128000,"context_percent":6.6},"balance":{"provider":"nous","remaining_micros":12500000,"remaining_usd":12.5,"paid_access":true,"as_of_ms":1763726400000}}}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `schema` | integer | Metadata version; currently `1` |
+| `generated_at` | string | ISO-8601 UTC timestamp when the terminal frame was built |
+| `latency_ms` | integer | Milliseconds from prompt acceptance to the terminal frame |
+| `model` | string | Model that produced the turn, when Hermes reports it |
+| `provider` | string | Provider for that model, when Hermes reports it |
+| `usage` | object | Per-turn token counts: `input_tokens`, `output_tokens`, `total_tokens`, and `reasoning_tokens`, `cache_read_tokens`, `cache_write_tokens` when available |
+| `session_usage` | object | Cumulative conversation counters: `input_tokens`, `output_tokens`, `total_tokens`, `api_calls`, `estimated_cost_usd`, `cost_status`, `cost_source`, and the context fields `context_tokens`, `context_length`, `context_percent` when available |
+| `balance` | object | Account view: `provider`, `remaining_micros`, `remaining_usd`, `subscription_micros`, `subscription_usd`, `subscription_limit_usd`, `purchased_micros`, `purchased_usd`, `paid_access`, `as_of_ms`, and an optional `plan_gauge` with `id`, `label`, `used_bp`, `resets_at_ms` |
+
+- `schema`, `generated_at`, and `latency_ms` are always present on a metadata
+  object. Every other field is omitted when Hermes does not expose the value;
+  the server never sends `null` or a fabricated placeholder.
+- `usage` describes one turn; `session_usage` describes the whole conversation.
+  The keys are distinct so a client cannot mistake session totals for the cost
+  of one reply.
+- The serialized `metadata` object is capped at 4096 bytes. If it would exceed
+  that bound or cannot be encoded as JSON, the server sends a bare
+  `{"type":"done"}` and the turn still completes normally.
+- Only a successful `done` frame carries metadata. `error` terminal frames never
+  do.
+- Metadata does not consume the response byte budget:
+  `HERMES_IROH_MAX_RESPONSE_BYTES` bounds assistant text only.
+- The object contains only the numeric, boolean, and short string fields listed
+  above. It never contains prompt or response text, node ids, chat ids, session
+  keys, API keys, tokens, credentials, endpoint URLs, or provider headers.
+- Collection is best-effort and feature-detected: an older or changed Hermes
+  core yields fewer fields, and a collection failure still produces a normal
+  `done`.
 
 ### Append-only delta semantics
 
@@ -432,6 +475,7 @@ without repair.
 | Prompt line | 64 KiB |
 | Delta frame content | 16 KiB |
 | Response content per turn | 4 MiB (`HERMES_IROH_MAX_RESPONSE_BYTES`) |
+| Response metadata per `done` frame | 4096 bytes |
 | Prompt read timeout | 30 s |
 | Turn timeout | 600 s (`HERMES_IROH_TURN_TIMEOUT`) |
 | Pending incoming handshakes | 32 (`HERMES_IROH_MAX_PENDING_HANDSHAKES`) |

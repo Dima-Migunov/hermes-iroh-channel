@@ -202,6 +202,14 @@ def addr_of(server):
     return iroh.EndpointTicket.from_string(server.ticket).endpoint_addr()
 
 
+def assert_turn_metadata(metadata: dict) -> None:
+    assert metadata["schema"] == 1
+    assert isinstance(metadata["generated_at"], str)
+    assert metadata["generated_at"].endswith("Z")
+    assert isinstance(metadata["latency_ms"], int)
+    assert metadata["latency_ms"] >= 0
+
+
 async def test_streamed_turn_end_to_end(tmp_path):
     reply = "The answer is forty-two, computed in three streamed parts."
     server, client_endpoint, adapter, service, _client_id = await build_stack(
@@ -225,6 +233,7 @@ async def test_streamed_turn_end_to_end(tmp_path):
         assert "".join(deltas) == reply
         assert all(frame for frame in deltas)
         assert frames[0]["session_id"] == "c1"
+        assert_turn_metadata(frames[-1]["metadata"])
         assert responder.turns == 1
         assert len(responder.events) == 1
         event = responder.events[0]
@@ -257,6 +266,43 @@ async def test_non_streamed_turn_end_to_end(tmp_path):
             "done",
         ]
         assert frames[1]["content"] == reply
+        assert_turn_metadata(frames[-1]["metadata"])
+    finally:
+        if client:
+            await client.close()
+        await server.stop()
+        await client_endpoint.close()
+
+
+async def test_error_terminal_has_no_metadata(tmp_path):
+    server, client_endpoint, adapter, service, _client_id = await build_stack(
+        tmp_path
+    )
+
+    async def responder(event) -> None:
+        await adapter.send(
+            event.source.chat_id,
+            "partial",
+            metadata={"expect_edits": True},
+        )
+        raise RuntimeError("turn failed")
+
+    adapter.handle_message = responder
+    client = None
+    try:
+        await server.start()
+        client = await Client.dial(client_endpoint, addr_of(server))
+        await client.send_prompt("boom", session_id="err")
+        frames = await client.until_terminal()
+
+        assert frames[0]["type"] == "start"
+        assert "".join(
+            frame["content"] for frame in frames if frame["type"] == "delta"
+        ) == "partial"
+        assert frames[-1]["type"] == "error"
+        assert frames[-1]["message"] == transport.ERR_INTERNAL
+        assert "metadata" not in frames[-1]
+        assert not any(frame["type"] == "done" for frame in frames)
     finally:
         if client:
             await client.close()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -212,6 +213,67 @@ async def test_start_is_idempotent():
     await session.start()
 
     assert [frame["type"] for frame in send.frames()] == ["start"]
+
+
+async def test_session_records_a_monotonic_start_timestamp():
+    before = time.monotonic()
+    session, _send = make_session()
+    after = time.monotonic()
+
+    assert before <= session.started_monotonic <= after
+
+
+async def test_finish_with_metadata_writes_done_once():
+    session, send = make_session()
+    await session.start()
+    metadata = {"schema": 1, "latency_ms": 5}
+
+    await session.finish(metadata=metadata)
+    await session.finish(metadata={"schema": 2})
+
+    assert send.frames() == [
+        {"type": "start", "session_id": "default"},
+        {"type": "done", "metadata": metadata},
+    ]
+    assert send.closed is True
+
+
+async def test_finish_with_empty_metadata_stays_bare():
+    session, send = make_session()
+    await session.start()
+
+    await session.finish(metadata={})
+
+    assert send.frames()[-1] == {"type": "done"}
+
+
+async def test_error_terminal_carries_no_metadata():
+    session, send = make_session()
+    await session.start()
+
+    await session.fail(transport.ERR_INTERNAL)
+
+    assert send.frames()[-1] == {
+        "type": "error",
+        "message": transport.ERR_INTERNAL,
+    }
+    assert "metadata" not in send.frames()[-1]
+
+
+async def test_metadata_does_not_consume_the_response_budget():
+    session, send = make_session(max_response_bytes=5)
+    await session.start()
+    await session.append("abcd")
+
+    await session.finish(metadata={"schema": 1})
+
+    assert [frame["type"] for frame in send.frames()] == [
+        "start",
+        "delta",
+        "done",
+    ]
+    assert send.frames()[-1]["metadata"] == {"schema": 1}
+    assert session.bytes_sent == 4
 
 
 async def test_response_cap_sends_one_terminal_error_and_stops():

@@ -8,6 +8,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -104,6 +105,292 @@ def test_non_streamed_single_send_emits_full_text():
 
     assert delta == reply
     assert router.mark_terminal("c") is True
+
+
+# --------------------------------------------------------------------------- #
+# Response metadata
+# --------------------------------------------------------------------------- #
+
+GENERATED_AT = "2026-11-21T12:00:00.000Z"
+
+
+def metadata_from(**kwargs) -> dict:
+    return gateway_adapter.build_metadata(
+        generated_at=GENERATED_AT, latency_ms=812, **kwargs
+    )
+
+
+def assert_done_frame(frame: dict) -> None:
+    assert frame["type"] == "done"
+    metadata = frame.get("metadata")
+    if metadata is not None:
+        assert metadata["schema"] == 1
+        assert metadata["generated_at"].endswith("Z")
+        assert metadata["latency_ms"] >= 0
+
+
+def test_metadata_without_sources_has_only_the_required_fields():
+    assert metadata_from() == {
+        "schema": 1,
+        "generated_at": GENERATED_AT,
+        "latency_ms": 812,
+    }
+
+
+def test_metadata_reads_model_settings_mapping():
+    metadata = metadata_from(
+        model_settings={"model": "gpt-5.1", "provider": "openai"}
+    )
+
+    assert metadata["model"] == "gpt-5.1"
+    assert metadata["provider"] == "openai"
+
+
+def test_metadata_reads_model_settings_attributes_and_provider_objects():
+    settings = SimpleNamespace(
+        model="claude", provider=SimpleNamespace(name="anthropic")
+    )
+
+    metadata = metadata_from(model_settings=settings)
+
+    assert metadata["model"] == "claude"
+    assert metadata["provider"] == "anthropic"
+
+
+def test_metadata_normalizes_turn_usage_and_computes_the_total():
+    metadata = metadata_from(
+        turn_usage={
+            "input_tokens": 1200,
+            "output_tokens": 300,
+            "reasoning_tokens": 40,
+            "cache_read_tokens": 50,
+            "cache_write_tokens": 10,
+        }
+    )
+
+    assert metadata["usage"] == {
+        "input_tokens": 1200,
+        "output_tokens": 300,
+        "total_tokens": 1500,
+        "reasoning_tokens": 40,
+        "cache_read_tokens": 50,
+        "cache_write_tokens": 10,
+    }
+
+
+def test_metadata_accepts_prompt_and_completion_usage_aliases():
+    metadata = metadata_from(
+        turn_usage={"prompt_tokens": 7, "completion_tokens": 5}
+    )
+
+    assert metadata["usage"] == {
+        "input_tokens": 7,
+        "output_tokens": 5,
+        "total_tokens": 12,
+    }
+
+
+def test_metadata_omits_incomplete_turn_usage():
+    metadata = metadata_from(turn_usage={"total_tokens": 10})
+
+    assert "usage" not in metadata
+
+
+def test_metadata_reads_live_agent_counters_cost_and_context():
+    agent = SimpleNamespace(
+        session_input_tokens=10200,
+        session_output_tokens=2400,
+        session_total_tokens=12600,
+        session_api_calls=8,
+        session_estimated_cost_usd=0.42,
+        session_cost_status="estimated",
+        session_cost_source="model_catalog",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=8400, context_length=128000
+        ),
+    )
+
+    metadata = metadata_from(agent=agent)
+
+    assert metadata["session_usage"] == {
+        "input_tokens": 10200,
+        "output_tokens": 2400,
+        "total_tokens": 12600,
+        "api_calls": 8,
+        "estimated_cost_usd": 0.42,
+        "cost_status": "estimated",
+        "cost_source": "model_catalog",
+        "context_tokens": 8400,
+        "context_length": 128000,
+        "context_percent": 6.6,
+    }
+
+
+def test_metadata_uses_a_reported_context_percent():
+    agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(
+            context_tokens=1000,
+            context_length=8000,
+            context_percent=12.5,
+        )
+    )
+
+    metadata = metadata_from(agent=agent)
+
+    assert metadata["session_usage"] == {
+        "context_tokens": 1000,
+        "context_length": 8000,
+        "context_percent": 12.5,
+    }
+
+
+def test_metadata_omits_session_usage_without_agent_counters():
+    metadata = metadata_from(agent=object())
+
+    assert "session_usage" not in metadata
+
+
+def test_metadata_reads_balance_from_the_live_credit_state():
+    credits = {
+        "provider": "nous",
+        "remaining_micros": 12_500_000,
+        "subscription_micros": 2_000_000,
+        "subscription_limit_micros": 10_000_000,
+        "purchased_micros": 1_000_000,
+        "paid_access": True,
+        "as_of_ms": 1763726400000,
+        "plan_gauges": [
+            {
+                "id": "monthly",
+                "label": "Monthly",
+                "used_bp": 1250,
+                "resets_at_ms": 1,
+                "binding": False,
+            },
+            {
+                "id": "weekly",
+                "label": "Weekly",
+                "used_bp": 400,
+                "resets_at_ms": 2,
+                "binding": True,
+            },
+        ],
+    }
+    agent = SimpleNamespace(_credits_state=credits)
+
+    metadata = metadata_from(agent=agent)
+
+    assert metadata["balance"] == {
+        "provider": "nous",
+        "remaining_micros": 12500000,
+        "remaining_usd": 12.5,
+        "subscription_micros": 2000000,
+        "subscription_usd": 2.0,
+        "subscription_limit_usd": 10.0,
+        "purchased_micros": 1000000,
+        "purchased_usd": 1.0,
+        "paid_access": True,
+        "as_of_ms": 1763726400000,
+        "plan_gauge": {
+            "id": "weekly",
+            "label": "Weekly",
+            "used_bp": 400,
+            "resets_at_ms": 2,
+        },
+    }
+
+
+def test_metadata_prefers_get_credits_state_over_the_private_attribute():
+    agent = SimpleNamespace(
+        get_credits_state=lambda: {"remaining_micros": 5_000_000},
+        _credits_state={"remaining_micros": 1},
+    )
+
+    metadata = metadata_from(agent=agent)
+
+    assert metadata["balance"]["remaining_micros"] == 5_000_000
+    assert metadata["balance"]["remaining_usd"] == 5.0
+
+
+def test_metadata_uses_the_turn_provider_when_credits_omit_it():
+    agent = SimpleNamespace(_credits_state={"as_of_ms": 1763726400000})
+
+    metadata = metadata_from(
+        model_settings={"provider": "openai"}, agent=agent
+    )
+
+    assert metadata["balance"]["provider"] == "openai"
+    assert metadata["balance"]["as_of_ms"] == 1763726400000
+
+
+def test_metadata_omits_unavailable_and_invalid_values():
+    metadata = metadata_from(
+        model_settings={"model": "", "provider": None},
+        turn_usage={"input_tokens": None, "output_tokens": "3"},
+        agent=SimpleNamespace(
+            session_input_tokens=None,
+            session_output_tokens="many",
+            session_api_calls=False,
+            context_compressor=SimpleNamespace(
+                last_prompt_tokens=None, context_length=None
+            ),
+            _credits_state={
+                "remaining_micros": None,
+                "paid_access": "yes",
+            },
+        ),
+    )
+
+    assert metadata == {
+        "schema": 1,
+        "generated_at": GENERATED_AT,
+        "latency_ms": 812,
+    }
+
+    def assert_no_null_values(value) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                assert item is not None
+                assert_no_null_values(item)
+
+    assert_no_null_values(metadata)
+
+
+def test_metadata_drops_long_strings_and_non_finite_numbers():
+    metadata = metadata_from(
+        model_settings={"model": "m" * 300, "provider": "openai"},
+        turn_usage={
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "reasoning_tokens": float("inf"),
+        },
+        agent=SimpleNamespace(session_estimated_cost_usd=float("nan")),
+    )
+
+    assert "model" not in metadata
+    assert metadata["provider"] == "openai"
+    assert metadata["usage"] == {
+        "input_tokens": 1,
+        "output_tokens": 2,
+        "total_tokens": 3,
+    }
+    assert "session_usage" not in metadata
+
+
+def test_metadata_drops_url_like_strings():
+    metadata = metadata_from(
+        model_settings={
+            "model": "https://models.example.com/v1",
+            "provider": "openai",
+        },
+        agent=SimpleNamespace(
+            session_cost_source="https://gateway.example.com/usage"
+        ),
+    )
+
+    assert "model" not in metadata
+    assert metadata["provider"] == "openai"
+    assert "session_usage" not in metadata
 
 
 # --------------------------------------------------------------------------- #
@@ -243,6 +530,51 @@ async def register_session(adapter, service, session) -> None:
         {"session_for": lambda self, chat_id: session if chat_id == session.chat_id else None},
     )()
     adapter._server = server
+
+
+class FakeRunner:
+    def __init__(self, agents: dict) -> None:
+        self.agents = agents
+        self.keys: list[str] = []
+
+    def _session_key_for_source(self, source) -> str:
+        self.keys.append(source.chat_id)
+        return source.chat_id
+
+    def _peek_session_state(self, key: str):
+        return {"turn_agent": self.agents.get(key)}
+
+
+class MultiSessionServer:
+    def __init__(self, sessions) -> None:
+        self.sessions = {
+            session.chat_id: session for session in sessions
+        }
+
+    def session_for(self, chat_id):
+        return self.sessions.get(chat_id)
+
+
+class ProbeAgent:
+    """Records unknown attribute reads and rejects credential-style names."""
+
+    FORBIDDEN = {"api_key", "credentials", "access_token", "provider_client"}
+
+    def __init__(self) -> None:
+        self.accessed: set[str] = set()
+        self.requests: list[str] = []
+        self.session_input_tokens = 12
+        self.session_output_tokens = 3
+        self.session_total_tokens = 15
+        self.session_api_calls = 1
+        self.context_compressor = SimpleNamespace(
+            last_prompt_tokens=120, context_length=1000
+        )
+        self._credits_state = {"remaining_micros": 1_000_000}
+
+    def __getattr__(self, name: str):
+        self.accessed.add(name)
+        raise AttributeError(name)
 
 
 # --------------------------------------------------------------------------- #
@@ -411,6 +743,7 @@ async def test_prompt_submission_failure_emits_internal_error(tmp_path):
         "type": "error",
         "message": transport.ERR_INTERNAL,
     }
+    assert "metadata" not in send.frames()[-1]
     assert send.closed is True
 
 
@@ -770,7 +1103,7 @@ async def test_streamed_preview_and_final_edit(tmp_path):
     assert "".join(
         frame["content"] for frame in send.frames() if frame["type"] == "delta"
     ) == "Hello world"
-    assert send.frames()[-1] == {"type": "done"}
+    assert_done_frame(send.frames()[-1])
     assert send.closed is True
 
 
@@ -784,11 +1117,14 @@ async def test_non_streamed_single_send_is_terminal(tmp_path):
     )
 
     assert result.success is True
-    assert send.frames() == [
-        {"type": "start", "session_id": "default"},
-        {"type": "delta", "content": "single reply"},
-        {"type": "done"},
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == [
+        "start",
+        "delta",
+        "done",
     ]
+    assert frames[1] == {"type": "delta", "content": "single reply"}
+    assert_done_frame(frames[-1])
 
 
 async def test_fresh_final_send_finishes_with_separator(tmp_path):
@@ -801,7 +1137,7 @@ async def test_fresh_final_send_finishes_with_separator(tmp_path):
 
     deltas = [f for f in send.frames() if f["type"] == "delta"]
     assert "".join(f["content"] for f in deltas) == "draft\n\nfinal answer"
-    assert send.frames()[-1] == {"type": "done"}
+    assert_done_frame(send.frames()[-1])
     assert sum(1 for f in send.frames() if f["type"] == "done") == 1
 
 
@@ -816,11 +1152,298 @@ async def test_duplicate_finalization_writes_nothing_more(tmp_path):
     )
     await adapter.send(session.chat_id, "answer", metadata={"notify": True})
 
-    assert send.frames() == [
-        {"type": "start", "session_id": "default"},
-        {"type": "delta", "content": "answer"},
-        {"type": "done"},
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == [
+        "start",
+        "delta",
+        "done",
     ]
+    assert frames[1] == {"type": "delta", "content": "answer"}
+    assert_done_frame(frames[-1])
+
+
+async def test_final_delivery_carries_response_metadata(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    seen_sources = []
+
+    def model_settings(source):
+        seen_sources.append(source)
+        return {"model": "gpt-5.1", "provider": "openai"}
+
+    adapter.get_session_model_settings = model_settings
+
+    result = await adapter.send(
+        session.chat_id, "answer", metadata={"notify": True}
+    )
+
+    assert result.success is True
+    done = send.frames()[-1]
+    assert done["type"] == "done"
+    assert done["metadata"]["schema"] == 1
+    assert done["metadata"]["model"] == "gpt-5.1"
+    assert done["metadata"]["provider"] == "openai"
+    assert done["metadata"]["latency_ms"] >= 0
+    assert done["metadata"]["generated_at"].endswith("Z")
+    assert len(seen_sources) == 1
+    source = seen_sources[0]
+    assert source.chat_id == session.chat_id
+    assert source.user_id == NODE_A
+    assert source.chat_type == "dm"
+
+
+async def test_empty_reply_still_carries_metadata(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+
+    await adapter.send(session.chat_id, "", metadata={"notify": True})
+
+    assert [frame["type"] for frame in send.frames()] == ["start", "done"]
+    assert send.frames()[-1]["metadata"]["schema"] == 1
+
+
+async def test_interim_and_edit_deliveries_stay_metadata_free(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+
+    await adapter.send(session.chat_id, "progress")
+    await adapter.send(
+        session.chat_id, "preview", metadata={"expect_edits": True}
+    )
+    await adapter.edit_message(session.chat_id, "m", "preview more")
+
+    assert send.frames()
+    assert all("metadata" not in frame for frame in send.frames())
+
+    await adapter.send(session.chat_id, "final", metadata={"notify": True})
+
+    frames = send.frames()
+    assert all("metadata" not in frame for frame in frames[:-1])
+    assert frames[-1]["type"] == "done"
+    assert frames[-1]["metadata"]["schema"] == 1
+
+
+async def test_collector_failure_still_produces_a_normal_done(
+    tmp_path, monkeypatch
+):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+
+    async def boom(adapter_arg, session_arg):
+        raise RuntimeError("collector exploded")
+
+    monkeypatch.setattr(gateway_adapter, "collect_response_metadata", boom)
+
+    result = await adapter.send(
+        session.chat_id, "answer", metadata={"notify": True}
+    )
+
+    assert result.success is True
+    assert send.frames()[-1] == {"type": "done"}
+    assert send.closed is True
+    assert not any(frame["type"] == "error" for frame in send.frames())
+
+
+async def test_duplicate_finalization_collects_metadata_once(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    calls = []
+
+    def model_settings(source):
+        calls.append(source)
+        return {"model": "gpt-5.1"}
+
+    adapter.get_session_model_settings = model_settings
+
+    await adapter.send(session.chat_id, "answer", metadata={"notify": True})
+    await adapter.edit_message(
+        session.chat_id, "m", "answer", finalize=True
+    )
+    await adapter.send(session.chat_id, "answer", metadata={"notify": True})
+
+    assert len(calls) == 1
+    assert sum(1 for frame in send.frames() if frame["type"] == "done") == 1
+
+
+def test_turn_agent_prefers_the_turn_agent_over_the_cached_agent():
+    turn_agent = SimpleNamespace(session_input_tokens=1)
+    cached_agent = SimpleNamespace(session_input_tokens=2)
+
+    assert gateway_adapter._turn_agent(
+        {"turn_agent": turn_agent, "cached_agent": cached_agent}
+    ) is turn_agent
+    assert gateway_adapter._turn_agent(
+        {"cached_agent": cached_agent}
+    ) is cached_agent
+    assert gateway_adapter._turn_agent(object()) is None
+
+
+async def test_concurrent_sessions_get_isolated_metadata(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    first, first_send = make_session(tmp_path, session_id="first")
+    second, second_send = make_session(tmp_path, session_id="second")
+    for session in (first, second):
+        service.router.reset(session.chat_id)
+        await session.start()
+    adapter._server = MultiSessionServer([first, second])
+
+    adapter.gateway_runner = FakeRunner(
+        {
+            first.chat_id: SimpleNamespace(
+                session_input_tokens=10,
+                session_output_tokens=5,
+                session_total_tokens=15,
+                session_api_calls=1,
+            ),
+            second.chat_id: SimpleNamespace(
+                session_input_tokens=100,
+                session_output_tokens=50,
+                session_total_tokens=150,
+                session_api_calls=2,
+            ),
+        }
+    )
+    models = {
+        first.chat_id: {"model": "model-first"},
+        second.chat_id: {"model": "model-second"},
+    }
+    adapter.get_session_model_settings = lambda source: models[source.chat_id]
+
+    await asyncio.gather(
+        adapter.send(first.chat_id, "a", metadata={"notify": True}),
+        adapter.send(second.chat_id, "b", metadata={"notify": True}),
+    )
+
+    first_metadata = first_send.frames()[-1]["metadata"]
+    second_metadata = second_send.frames()[-1]["metadata"]
+    assert first_metadata["model"] == "model-first"
+    assert first_metadata["session_usage"] == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "api_calls": 1,
+    }
+    assert second_metadata["model"] == "model-second"
+    assert second_metadata["session_usage"] == {
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "total_tokens": 150,
+        "api_calls": 2,
+    }
+
+
+async def test_consecutive_turns_reflect_the_current_counters(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    chat_id = transport.make_chat_id(NODE_A, "default")
+    runner = FakeRunner(
+        {
+            chat_id: SimpleNamespace(
+                session_input_tokens=10,
+                session_output_tokens=5,
+                session_total_tokens=15,
+                session_api_calls=1,
+            )
+        }
+    )
+    adapter.gateway_runner = runner
+
+    first, first_send = make_session(tmp_path)
+    await register_session(adapter, service, first)
+    await adapter.send(chat_id, "one", metadata={"notify": True})
+
+    runner.agents[chat_id] = SimpleNamespace(
+        session_input_tokens=25,
+        session_output_tokens=10,
+        session_total_tokens=35,
+        session_api_calls=2,
+    )
+    second, second_send = make_session(tmp_path)
+    await register_session(adapter, service, second)
+    await adapter.send(chat_id, "two", metadata={"notify": True})
+
+    assert first_send.frames()[-1]["metadata"]["session_usage"] == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "api_calls": 1,
+    }
+    assert second_send.frames()[-1]["metadata"]["session_usage"] == {
+        "input_tokens": 25,
+        "output_tokens": 10,
+        "total_tokens": 35,
+        "api_calls": 2,
+    }
+
+
+async def test_metadata_reads_turn_usage_from_the_gateway_execution_result(
+    tmp_path, monkeypatch
+):
+    import contextvars
+    import types
+
+    gateway_module = types.ModuleType("gateway")
+    session_results = types.ModuleType("gateway.session_results")
+    execution_result = contextvars.ContextVar("execution_result")
+    execution_result.set(
+        {"usage": {"input_tokens": 11, "output_tokens": 4}}
+    )
+    session_results.execution_result = execution_result
+    gateway_module.session_results = session_results
+    monkeypatch.setitem(sys.modules, "gateway", gateway_module)
+    monkeypatch.setitem(
+        sys.modules, "gateway.session_results", session_results
+    )
+
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+
+    await adapter.send(session.chat_id, "answer", metadata={"notify": True})
+
+    assert send.frames()[-1]["metadata"]["usage"] == {
+        "input_tokens": 11,
+        "output_tokens": 4,
+        "total_tokens": 15,
+    }
+
+
+async def test_metadata_reads_an_async_model_settings_accessor(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+
+    async def model_settings(source):
+        return {"model": "async-model", "provider": "async-provider"}
+
+    adapter.get_session_model_settings = model_settings
+
+    await adapter.send(session.chat_id, "answer", metadata={"notify": True})
+
+    metadata = send.frames()[-1]["metadata"]
+    assert metadata["model"] == "async-model"
+    assert metadata["provider"] == "async-provider"
+
+
+async def test_collection_reads_no_credentials_and_makes_no_requests(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    agent = ProbeAgent()
+    adapter.gateway_runner = FakeRunner({session.chat_id: agent})
+    adapter.get_session_model_settings = lambda source: {"model": "model"}
+
+    await adapter.send(session.chat_id, "answer", metadata={"notify": True})
+
+    metadata = send.frames()[-1]["metadata"]
+    assert metadata["session_usage"]["input_tokens"] == 12
+    assert metadata["balance"]["remaining_micros"] == 1_000_000
+    assert agent.requests == []
+    assert agent.accessed.isdisjoint(ProbeAgent.FORBIDDEN)
 
 
 async def test_send_without_active_stream_fails(tmp_path):

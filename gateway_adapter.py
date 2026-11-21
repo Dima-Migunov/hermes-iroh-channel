@@ -8,9 +8,15 @@ in a plain Python environment. The transport contract it consumes lives in
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
+import inspect
 import logging
+import math
 import os
+import time
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -38,6 +44,22 @@ PLATFORM_HINT = (
     "are not supported: never claim to send files or images."
 )
 SEGMENT_SEPARATOR = "\n\n"
+
+METADATA_SCHEMA = 1
+METADATA_STRING_MAX = 256
+MICROS_PER_USD = 1_000_000
+
+_USAGE_FIELDS = (
+    ("input_tokens", ("input_tokens", "prompt_tokens")),
+    ("output_tokens", ("output_tokens", "completion_tokens")),
+    ("total_tokens", ("total_tokens",)),
+    ("reasoning_tokens", ("reasoning_tokens",)),
+    ("cache_read_tokens", ("cache_read_tokens", "cache_read_input_tokens")),
+    (
+        "cache_write_tokens",
+        ("cache_write_tokens", "cache_creation_input_tokens"),
+    ),
+)
 
 
 class ResponseRouter:
@@ -241,12 +263,437 @@ async def handle_revoke(service: ChannelService, args: str = "") -> str:
     return f"revoked: {normalized}"
 
 
+def _read_field(source: Any, *names: str) -> Any:
+    if source is None:
+        return None
+    for name in names:
+        try:
+            if isinstance(source, Mapping):
+                value = source.get(name)
+            else:
+                value = getattr(source, name, None)
+        except Exception:
+            value = None
+        if value is not None:
+            return value
+    return None
+
+
+def _metadata_string(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > METADATA_STRING_MAX or "://" in text:
+        return None
+    return text
+
+
+def _metadata_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _metadata_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if math.isfinite(number):
+            return number
+    return None
+
+
+def _metadata_bool(value: Any) -> Optional[bool]:
+    return value if isinstance(value, bool) else None
+
+
+def _usage_counters(
+    source: Any, *, prefix: str = "", require_io: bool = False
+) -> dict:
+    counters: dict[str, int] = {}
+    for name, aliases in _USAGE_FIELDS:
+        value = _metadata_int(
+            _read_field(source, *(f"{prefix}{alias}" for alias in aliases))
+        )
+        if value is not None:
+            counters[name] = value
+    if "total_tokens" not in counters:
+        input_tokens = counters.get("input_tokens")
+        output_tokens = counters.get("output_tokens")
+        if input_tokens is not None and output_tokens is not None:
+            counters["total_tokens"] = input_tokens + output_tokens
+    if require_io and not {
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+    } <= counters.keys():
+        return {}
+    return counters
+
+
+def _model_identity(settings: Any) -> dict:
+    identity: dict[str, Any] = {}
+    model = _metadata_string(_read_field(settings, "model", "model_name"))
+    raw_provider = _read_field(settings, "provider", "provider_name")
+    provider = _metadata_string(raw_provider)
+    if provider is None:
+        provider = _metadata_string(
+            _read_field(raw_provider, "name", "value")
+        )
+    if model:
+        identity["model"] = model
+    if provider:
+        identity["provider"] = provider
+    return identity
+
+
+def _context_fields(agent: Any) -> dict:
+    compressor = _read_field(agent, "context_compressor")
+    tokens = _metadata_int(
+        _read_field(
+            compressor,
+            "context_tokens",
+            "last_prompt_tokens",
+            "current_tokens",
+            "last_real_tokens",
+        )
+    )
+    if tokens is None:
+        tokens = _metadata_int(
+            _read_field(agent, "context_tokens", "last_prompt_tokens")
+        )
+    length = _metadata_int(
+        _read_field(
+            compressor, "context_length", "max_tokens", "context_window"
+        )
+    )
+    if length is None:
+        length = _metadata_int(
+            _read_field(agent, "context_length", "context_window")
+        )
+    percent = _metadata_float(
+        _read_field(compressor, "context_percent", "used_percent")
+    )
+    if percent is None:
+        percent = _metadata_float(_read_field(agent, "context_percent"))
+    if percent is None and tokens is not None and length:
+        percent = round(tokens * 100.0 / length, 1)
+    fields: dict[str, Any] = {}
+    if tokens is not None:
+        fields["context_tokens"] = tokens
+    if length is not None:
+        fields["context_length"] = length
+    if percent is not None:
+        fields["context_percent"] = percent
+    return fields
+
+
+def _session_usage(agent: Any) -> dict:
+    usage = _usage_counters(agent, prefix="session_")
+    api_calls = _metadata_int(
+        _read_field(agent, "session_api_calls", "api_calls")
+    )
+    if api_calls is not None:
+        usage["api_calls"] = api_calls
+    estimated = _metadata_float(
+        _read_field(agent, "session_estimated_cost_usd", "estimated_cost_usd")
+    )
+    if estimated is not None:
+        usage["estimated_cost_usd"] = estimated
+    for field, names in (
+        ("cost_status", ("session_cost_status", "cost_status")),
+        ("cost_source", ("session_cost_source", "cost_source")),
+    ):
+        value = _metadata_string(_read_field(agent, *names))
+        if value is not None:
+            usage[field] = value
+    usage.update(_context_fields(agent))
+    return usage
+
+
+def _credits_state(agent: Any) -> Any:
+    if agent is None:
+        return None
+    getter = getattr(agent, "get_credits_state", None)
+    if callable(getter):
+        try:
+            state = getter()
+        except Exception:
+            state = None
+        if inspect.isawaitable(state):
+            close = getattr(state, "close", None)
+            if callable(close):
+                close()
+            state = None
+        if state is not None:
+            return state
+    try:
+        return getattr(agent, "_credits_state", None)
+    except Exception:
+        return None
+
+
+def _add_amount_pair(
+    target: dict,
+    source: Any,
+    usd_name: str,
+    micros_name: str,
+    *,
+    include_micros: bool = True,
+) -> None:
+    micros = _metadata_int(_read_field(source, micros_name))
+    usd = _metadata_float(_read_field(source, usd_name))
+    if usd is None and micros is not None:
+        usd = round(micros / MICROS_PER_USD, 6)
+    if micros is not None and include_micros:
+        target[micros_name] = micros
+    if usd is not None:
+        target[usd_name] = usd
+
+
+def _plan_gauge(credits: Any) -> Optional[dict]:
+    direct = _read_field(credits, "plan_gauge")
+    candidates: list[Any] = []
+    if direct is not None:
+        candidates.append(direct)
+    else:
+        gauges = _read_field(credits, "plan_gauges", "gauges")
+        if isinstance(gauges, (list, tuple)):
+            binding = [
+                gauge
+                for gauge in gauges
+                if _metadata_bool(
+                    _read_field(gauge, "binding", "is_binding", "primary")
+                )
+            ]
+            candidates.extend(binding or gauges)
+    for gauge in candidates:
+        result: dict[str, Any] = {}
+        identifier = _metadata_string(_read_field(gauge, "id"))
+        label = _metadata_string(_read_field(gauge, "label"))
+        used_bp = _metadata_int(_read_field(gauge, "used_bp"))
+        resets_at_ms = _metadata_int(_read_field(gauge, "resets_at_ms"))
+        if identifier is not None:
+            result["id"] = identifier
+        if label is not None:
+            result["label"] = label
+        if used_bp is not None:
+            result["used_bp"] = used_bp
+        if resets_at_ms is not None:
+            result["resets_at_ms"] = resets_at_ms
+        if result:
+            return result
+    return None
+
+
+def _account_balance(
+    credits: Any, fallback_provider: Optional[str]
+) -> dict:
+    if credits is None:
+        return {}
+    fields: dict[str, Any] = {}
+    _add_amount_pair(fields, credits, "remaining_usd", "remaining_micros")
+    _add_amount_pair(
+        fields, credits, "subscription_usd", "subscription_micros"
+    )
+    _add_amount_pair(
+        fields,
+        credits,
+        "subscription_limit_usd",
+        "subscription_limit_micros",
+        include_micros=False,
+    )
+    _add_amount_pair(fields, credits, "purchased_usd", "purchased_micros")
+    paid_access = _metadata_bool(_read_field(credits, "paid_access"))
+    if paid_access is not None:
+        fields["paid_access"] = paid_access
+    as_of_ms = _metadata_int(_read_field(credits, "as_of_ms"))
+    if as_of_ms is not None:
+        fields["as_of_ms"] = as_of_ms
+    gauge = _plan_gauge(credits)
+    if gauge is not None:
+        fields["plan_gauge"] = gauge
+    if not fields:
+        return {}
+    balance: dict[str, Any] = {}
+    provider = _metadata_string(_read_field(credits, "provider"))
+    provider = provider or fallback_provider
+    if provider:
+        balance["provider"] = provider
+    balance.update(fields)
+    return balance
+
+
+def build_metadata(
+    *,
+    generated_at: str,
+    latency_ms: int,
+    model_settings: Any = None,
+    turn_usage: Any = None,
+    agent: Any = None,
+) -> dict:
+    metadata: dict[str, Any] = {
+        "schema": METADATA_SCHEMA,
+        "generated_at": generated_at,
+        "latency_ms": max(0, _metadata_int(latency_ms) or 0),
+    }
+    identity = _model_identity(model_settings)
+    metadata.update(identity)
+    usage = _usage_counters(turn_usage, require_io=True)
+    if usage:
+        metadata["usage"] = usage
+    session_usage = _session_usage(agent)
+    if session_usage:
+        metadata["session_usage"] = session_usage
+    balance = _account_balance(
+        _credits_state(agent), identity.get("provider")
+    )
+    if balance:
+        metadata["balance"] = balance
+    return metadata
+
+
+def _utc_timestamp(epoch_seconds: Optional[float] = None) -> str:
+    moment = (
+        datetime.fromtimestamp(epoch_seconds, tz=timezone.utc)
+        if epoch_seconds is not None
+        else datetime.now(timezone.utc)
+    )
+    return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _session_latency_ms(session: Any) -> int:
+    started = getattr(session, "started_monotonic", None)
+    if started is None:
+        return 0
+    return max(0, int(round((time.monotonic() - started) * 1000)))
+
+
+def _stream_source(
+    adapter: Any, session: transport.StreamSession
+) -> Any:
+    return adapter.build_source(
+        chat_id=session.chat_id,
+        chat_name=session.node_id,
+        chat_type="dm",
+        user_id=session.node_id,
+        user_name=session.node_id[:12],
+    )
+
+
+def _session_source(adapter: Any, session: transport.StreamSession) -> Any:
+    build_source = getattr(adapter, "build_source", None)
+    if not callable(build_source):
+        return None
+    try:
+        return _stream_source(adapter, session)
+    except Exception:
+        return None
+
+
+async def _session_model_settings(adapter: Any, source: Any) -> Any:
+    accessor = getattr(adapter, "get_session_model_settings", None)
+    if not callable(accessor):
+        return None
+    try:
+        settings = accessor(source)
+        if inspect.isawaitable(settings):
+            settings = await settings
+    except Exception:
+        return None
+    return settings
+
+
+def _turn_agent(state: Any) -> Any:
+    for name in ("turn_agent", "agent", "cached_agent", "active_agent"):
+        agent = _read_field(state, name)
+        if agent is not None:
+            return agent
+    return None
+
+
+def _live_agent(adapter: Any, source: Any) -> Any:
+    runner = getattr(adapter, "gateway_runner", None)
+    if runner is None or source is None:
+        return None
+    key_for_source = getattr(runner, "_session_key_for_source", None)
+    peek_state = getattr(runner, "_peek_session_state", None)
+    if not callable(key_for_source) or not callable(peek_state):
+        return None
+    try:
+        key = key_for_source(source)
+        state = peek_state(key)
+    except Exception:
+        return None
+    return _turn_agent(state)
+
+
+def _execution_holder_value(holder: Any) -> Any:
+    if holder is None:
+        return None
+    if isinstance(holder, contextvars.ContextVar):
+        try:
+            return holder.get()
+        except Exception:
+            return None
+    getter = getattr(holder, "get", None)
+    if callable(getter) and not isinstance(holder, Mapping):
+        try:
+            return getter()
+        except Exception:
+            return None
+    if callable(holder) and not isinstance(holder, type):
+        try:
+            return holder()
+        except Exception:
+            return None
+    return holder
+
+
+def _execution_usage() -> Any:
+    try:
+        from gateway import session_results
+    except Exception:
+        return None
+    holder = getattr(session_results, "execution_result", None)
+    value = _execution_holder_value(holder)
+    usage = _read_field(value, "usage")
+    if usage is not None:
+        return usage
+    return value
+
+
+async def collect_response_metadata(
+    adapter: Any,
+    session: transport.StreamSession,
+    *,
+    now: Optional[float] = None,
+) -> dict:
+    source = _session_source(adapter, session)
+    model_settings = await _session_model_settings(adapter, source)
+    return build_metadata(
+        generated_at=_utc_timestamp(now),
+        latency_ms=_session_latency_ms(session),
+        model_settings=model_settings,
+        turn_usage=_execution_usage(),
+        agent=_live_agent(adapter, source),
+    )
+
+
 async def deliver_message(
     service: ChannelService,
     session: transport.StreamSession,
     content: str,
     *,
     finalize: bool,
+    metadata_factory: Optional[
+        Callable[[transport.StreamSession], Any]
+    ] = None,
 ) -> None:
     if session.terminal:
         return
@@ -254,7 +701,17 @@ async def deliver_message(
     if delta:
         await session.append(delta)
     if finalize and service.router.mark_terminal(session.chat_id):
-        await session.finish()
+        metadata: Optional[dict] = None
+        if metadata_factory is not None:
+            try:
+                metadata = await metadata_factory(session)
+            except Exception as exc:
+                logger.debug(
+                    "iroh response metadata collection failed: %s",
+                    type(exc).__name__,
+                )
+                metadata = None
+        await session.finish(metadata=metadata)
         service.router.release(session.chat_id)
 
 
@@ -264,13 +721,7 @@ def build_prompt_handler(
     async def _on_prompt(
         session: transport.StreamSession, text: str
     ) -> None:
-        source = adapter.build_source(
-            chat_id=session.chat_id,
-            chat_name=session.node_id,
-            chat_type="dm",
-            user_id=session.node_id,
-            user_name=session.node_id[:12],
-        )
+        source = _stream_source(adapter, session)
         event = event_factory(text=text, source=source)
         service.router.reset(session.chat_id)
         try:
@@ -386,8 +837,19 @@ def build_adapter_class(
             session = self._session(chat_id)
             if session is None:
                 return _no_active_stream_result(send_result)
-            await deliver_message(service, session, content, finalize=finalize)
+            await deliver_message(
+                service,
+                session,
+                content,
+                finalize=finalize,
+                metadata_factory=self._response_metadata,
+            )
             return send_result(success=True, message_id=session.chat_id)
+
+        async def _response_metadata(
+            self, session: transport.StreamSession
+        ) -> dict:
+            return await collect_response_metadata(self, session)
 
         async def send_typing(self, *args: Any, **kwargs: Any) -> None:
             del args, kwargs
