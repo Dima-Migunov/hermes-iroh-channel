@@ -1064,6 +1064,104 @@ async def test_allow_reports_write_failure_without_raising(tmp_path, monkeypatch
     assert not (tmp_path / "allowlist.json").exists()
 
 
+async def test_revoke_removes_node_id_and_confirms(tmp_path):
+    service = make_command_service(tmp_path)
+    await gateway_adapter.handle_allow(service, NODE_A)
+
+    text = await gateway_adapter.handle_revoke(service, NODE_A)
+
+    assert text == f"revoked: {NODE_A}"
+    assert service.allowlist.check(NODE_A) is False
+    payload = json.loads((tmp_path / "allowlist.json").read_text(encoding="utf-8"))
+    assert payload == {"allowed_node_ids": []}
+
+
+async def test_revoke_normalizes_case_and_whitespace(tmp_path):
+    service = make_command_service(tmp_path)
+    await gateway_adapter.handle_allow(service, NODE_A)
+
+    text = await gateway_adapter.handle_revoke(service, f"  {NODE_A.upper()}  ")
+
+    assert text == f"revoked: {NODE_A}"
+    assert service.allowlist.check(NODE_A) is False
+
+
+async def test_revoke_without_argument_returns_usage(tmp_path):
+    service = make_command_service(tmp_path)
+
+    text = await gateway_adapter.handle_revoke(service, "")
+
+    assert text == "usage: /iroh_revoke <client_node_id>"
+    assert not (tmp_path / "allowlist.json").exists()
+
+
+async def test_revoke_with_extra_arguments_returns_usage(tmp_path):
+    service = make_command_service(tmp_path)
+
+    text = await gateway_adapter.handle_revoke(service, f"{NODE_A} {NODE_B}")
+
+    assert text == "usage: /iroh_revoke <client_node_id>"
+    assert not (tmp_path / "allowlist.json").exists()
+
+
+@pytest.mark.parametrize("value", ["not-a-node-id", "a" * 63, "g" * 64])
+async def test_revoke_rejects_invalid_node_ids(tmp_path, value):
+    service = make_command_service(tmp_path)
+
+    text = await gateway_adapter.handle_revoke(service, value)
+
+    assert text.startswith("invalid node id")
+    assert not (tmp_path / "allowlist.json").exists()
+
+
+async def test_revoke_reports_write_failure_without_raising(
+    tmp_path, monkeypatch
+):
+    service = make_command_service(tmp_path)
+    await gateway_adapter.handle_allow(service, NODE_A)
+
+    def fail_write(*args, **kwargs):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(transport, "_write_file_atomic", fail_write)
+
+    text = await gateway_adapter.handle_revoke(service, NODE_A)
+
+    assert text == "could not update allowlist: PermissionError"
+    payload = json.loads((tmp_path / "allowlist.json").read_text(encoding="utf-8"))
+    assert payload == {"allowed_node_ids": [NODE_A]}
+
+
+async def test_revoke_of_absent_entry_without_a_file_creates_nothing(tmp_path):
+    service = make_command_service(tmp_path)
+
+    text = await gateway_adapter.handle_revoke(service, NODE_A)
+
+    assert text == f"revoked: {NODE_A}"
+    assert not (tmp_path / "allowlist.json").exists()
+
+
+async def test_revoke_reports_environment_authorization(tmp_path):
+    service = gateway_adapter.ChannelService(
+        key_store=transport.NodeKeyStore(
+            path=tmp_path / "node.key", backend=FakeBackend()
+        ),
+        allowlist=transport.Allowlist(
+            path=tmp_path / "allowlist.json", env_reader=lambda: NODE_A
+        ),
+    )
+    await gateway_adapter.handle_allow(service, NODE_A)
+
+    text = await gateway_adapter.handle_revoke(service, NODE_A)
+
+    assert text == (
+        f"still authorized: {NODE_A} (HERMES_IROH_ALLOWLIST)"
+    )
+    assert service.allowlist.check(NODE_A) is True
+    payload = json.loads((tmp_path / "allowlist.json").read_text(encoding="utf-8"))
+    assert payload == {"allowed_node_ids": []}
+
+
 # --------------------------------------------------------------------------- #
 # register()
 # --------------------------------------------------------------------------- #
@@ -1219,13 +1317,13 @@ def test_register_omits_trusted_inbound_when_unsupported(fake_hermes):
     gateway_adapter.ChannelService.reset()
 
 
-def test_register_registers_both_commands(fake_hermes):
+def test_register_registers_all_commands(fake_hermes):
     ctx = FakeContext()
 
     gateway_adapter.register(ctx)
 
     names = {command["name"] for command in ctx.commands}
-    assert names == {"iroh_info", "iroh_allow"}
+    assert names == {"iroh_info", "iroh_allow", "iroh_revoke"}
     for command in ctx.commands:
         assert callable(command["handler"])
         assert command["description"]
@@ -1258,11 +1356,15 @@ async def test_registered_command_handlers_are_awaitable(fake_hermes, tmp_path):
 
     info = await handlers["iroh_info"]("")
     allowed = await handlers["iroh_allow"](NODE_A)
-    usage = await handlers["iroh_allow"]("")
+    allow_usage = await handlers["iroh_allow"]("")
+    revoked = await handlers["iroh_revoke"](NODE_A)
+    revoke_usage = await handlers["iroh_revoke"]("")
 
     assert service.node_id() in info
     assert allowed == f"allowlisted: {NODE_A}"
-    assert "usage" in usage.lower()
+    assert "usage" in allow_usage.lower()
+    assert revoked == f"revoked: {NODE_A}"
+    assert "usage" in revoke_usage.lower()
     gateway_adapter.ChannelService.reset()
 
 

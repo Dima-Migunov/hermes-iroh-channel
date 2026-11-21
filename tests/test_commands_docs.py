@@ -131,6 +131,70 @@ async def test_allow_write_failure_message_matches_readme(tmp_path, monkeypatch)
     assert "could not update allowlist: <error class>" in readme
 
 
+async def test_revoke_confirmation_matches_readme(tmp_path):
+    service = make_service(tmp_path)
+    await gateway_adapter.handle_allow(service, NODE_ID)
+    text = await gateway_adapter.handle_revoke(service, NODE_ID)
+    readme = README.read_text(encoding="utf-8")
+
+    assert text == f"revoked: {NODE_ID}"
+    assert f"→ revoked: {NODE_ID}" in readme
+
+
+async def test_revoke_usage_line_matches_readme(tmp_path):
+    service = make_service(tmp_path)
+    text = await gateway_adapter.handle_revoke(service, "")
+    readme = README.read_text(encoding="utf-8")
+
+    assert text == "usage: /iroh_revoke <client_node_id>"
+    assert text in readme
+
+
+async def test_revoke_invalid_message_matches_readme(tmp_path):
+    service = make_service(tmp_path)
+    text = await gateway_adapter.handle_revoke(service, "nope")
+    readme = README.read_text(encoding="utf-8")
+
+    assert text.startswith("invalid node id: ")
+    assert "invalid node id: <reason>" in readme
+
+
+async def test_revoke_write_failure_message_matches_readme(
+    tmp_path, monkeypatch
+):
+    service = make_service(tmp_path)
+    await gateway_adapter.handle_allow(service, NODE_ID)
+
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(transport, "_write_file_atomic", fail_write)
+    text = await gateway_adapter.handle_revoke(service, NODE_ID)
+    readme = README.read_text(encoding="utf-8")
+
+    assert text == "could not update allowlist: OSError"
+    assert "could not update allowlist: <error class>" in readme
+
+
+async def test_revoke_environment_warning_matches_readme(tmp_path):
+    service = gateway_adapter.ChannelService(
+        key_store=transport.NodeKeyStore(
+            path=tmp_path / "node.key", backend=FakeBackend()
+        ),
+        allowlist=transport.Allowlist(
+            path=tmp_path / "allowlist.json", env_reader=lambda: NODE_ID
+        ),
+    )
+    await gateway_adapter.handle_allow(service, NODE_ID)
+    text = await gateway_adapter.handle_revoke(service, NODE_ID)
+    readme = README.read_text(encoding="utf-8")
+
+    assert text == f"still authorized: {NODE_ID} (HERMES_IROH_ALLOWLIST)"
+    assert (
+        "still authorized: <normalized-id> (HERMES_IROH_ALLOWLIST)" in readme
+    )
+
+
 def test_readme_documents_all_delivery_limitations():
     readme = README.read_text(encoding="utf-8")
 

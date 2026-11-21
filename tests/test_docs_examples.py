@@ -130,7 +130,7 @@ def test_documented_slash_commands_match_the_registered_names():
     documented = set(re.findall(r"`/(iroh_[a-z]+)", text))
     source = (README.parent / "gateway_adapter.py").read_text(encoding="utf-8")
 
-    assert documented == {"iroh_info", "iroh_allow"}
+    assert documented == {"iroh_info", "iroh_allow", "iroh_revoke"}
     for name in documented:
         assert f'name="{name}"' in source
 

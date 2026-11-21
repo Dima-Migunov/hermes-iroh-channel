@@ -6,8 +6,43 @@ ticket, authenticate with node keys, and exchange newline-delimited JSON frames
 over QUIC bidirectional streams. No inbound port, no platform account, and no
 relay account are required to run the plugin.
 
+## What this is for
+
+Iroh Channel connects Hermes Agent to a desktop client over one direct, encrypted
+Iroh connection. Use it to chat with the agent from another machine without an
+inbound port, a VPN, or a platform account. This plugin is the server half: it
+serves allowlisted clients, and a client application is required to talk to it.
+
+## Client application
+
+**Hermes Iroh App** ([`hermes-iroh-app`](https://github.com/Dima-Migunov/hermes-iroh-app))
+is the supported desktop client for Windows, macOS (Apple Silicon), and Linux.
+Download a build from its
+[releases page](https://github.com/Dima-Migunov/hermes-iroh-app/releases).
+
+The app generates a stable client node id, shown under Connection on its Settings
+page. Allowlist that node id on the server with
+`/iroh_allow <client_node_id>` before the app can connect. The id is derived from
+the app's local key and survives app restarts; losing that key creates a new node
+id that must be allowlisted again.
+
 This repository is the plugin directory: install it with
 `hermes plugins install Dima-Migunov/hermes-iroh-channel`.
+
+## Quick start
+
+1. Install the plugin:
+   `hermes plugins install Dima-Migunov/hermes-iroh-channel`
+   ([details](#installation)).
+2. Enable it with `scripts/enable.sh`, or use the
+   [manual commands](#1-enable-the-plugin-and-the-platform).
+3. [Restart the gateway from outside it](#2-restart-the-gateway-from-outside-it).
+4. Read the ticket with `/iroh_info` ([details](#3-check-iroh_info)).
+5. Install Hermes Iroh App ([download](#client-application)).
+6. Copy the client node id from the app's Settings page and authorize it with
+   `/iroh_allow <client_node_id>` ([details](#5-authorize-the-client)).
+7. Paste the ticket into the app's server target field in Settings, then connect
+   ([details](#4-send-the-ticket)).
 
 ## Layout
 
@@ -103,8 +138,8 @@ full output.
 
 ### 4. Send the ticket
 
-Send the ticket to the client application. The node id identifies this agent;
-the ticket is the dial string.
+Send the ticket to Hermes Iroh App: paste it into the app's server target field
+in Settings. The node id identifies this agent; the ticket is the dial string.
 
 ### 5. Authorize the client
 
@@ -115,6 +150,10 @@ the ticket is the dial string.
 The client's node id must be in the allowlist before it can connect. Additions
 take effect for the next connection without a restart. See
 [`/iroh_allow`](#iroh_allow-client_node_id).
+
+Revoke access later with `/iroh_revoke <client_node_id>`; removal also takes
+effect for the node's next stream without a restart. See
+[`/iroh_revoke`](#iroh_revoke-client_node_id).
 
 ### Troubleshooting installation
 
@@ -238,9 +277,10 @@ Behavior:
   read. It runs again for every new stream before the prompt is read and again
   before the session is created. A rejected connection or stream is closed and no
   Hermes event is created.
-- Revocation applies to new streams on established connections: removing an entry
-  makes the next stream from that node fail with `unauthorized`. A turn that is
-  already running may finish. Re-adding the entry accepts new streams again.
+- Revocation applies to new streams on established connections: after
+  `/iroh_revoke` removes an entry, the next stream from that node fails with
+  `unauthorized`. A turn that is already running may finish. Re-adding the entry
+  accepts new streams again.
 - Entries are deduplicated and persisted in normalized form. The file is
   rewritten atomically with mode `0600`.
 - The file is re-read when its mtime or size changes, so manual edits and
@@ -249,9 +289,9 @@ Behavior:
 - Additions are validated as 64-character hexadecimal Iroh node ids (and through
   `EndpointId.from_string` when `iroh` is importable). Invalid values are refused
   and the allowlist is unchanged.
-- `/iroh_allow` refuses to rewrite a symlinked, wrong-owner, or group/world-
-  writable file. A malformed but otherwise safe file can still be repaired by an
-  explicit add.
+- `/iroh_allow` and `/iroh_revoke` refuse to rewrite a symlinked, wrong-owner,
+  or group/world-writable file. A malformed but otherwise safe file can still be
+  repaired by an explicit add.
 
 The environment variable is a bootstrap mechanism, for example a container
 secret. It does not replace the file, and nothing written by `/iroh_allow` goes
@@ -519,8 +559,8 @@ session ids are isolated.
 
 ## Slash commands
 
-Both commands run in the gateway process that owns the session and return text
-to the dispatcher; they never print and never raise into it.
+All three commands run in the gateway process that owns the session and return
+text to the dispatcher; they never print and never raise into it.
 
 ### `/iroh_info`
 
@@ -576,6 +616,30 @@ cannot be written — including when it is a symlink, is not owned by the curren
 user, is group- or world-writable, or the state directory is insecure — it
 returns `could not update allowlist: <error class>` and changes nothing.
 Additions take effect for the next stream without a restart.
+
+### `/iroh_revoke <client_node_id>`
+
+Validates the value, removes it from `allowlist.json`, and confirms the
+normalized id:
+
+```text
+/iroh_revoke 3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29
+→ revoked: 3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29
+```
+
+With no argument or with extra arguments it returns
+`usage: /iroh_revoke <client_node_id>` and changes nothing. An invalid value
+returns `invalid node id: <reason>` and changes nothing. If the allowlist file
+cannot be written — including when it is a symlink, is not owned by the current
+user, is group- or world-writable, or the state directory is insecure — it
+returns `could not update allowlist: <error class>` and changes nothing. An id
+that is not in the file is accepted without creating the file. Removal takes
+effect for the node's next stream without a restart.
+
+`HERMES_IROH_ALLOWLIST` is a separate authorization source that this command
+does not edit. When the variable still contains the id, the response is
+`still authorized: <normalized-id> (HERMES_IROH_ALLOWLIST)` instead of a
+revocation confirmation.
 
 ## Delivery behavior and limitations
 

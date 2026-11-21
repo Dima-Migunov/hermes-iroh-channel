@@ -333,3 +333,37 @@ def test_allow_command_still_repairs_a_malformed_safe_file(tmp_path):
     assert json.loads(path.read_text(encoding="utf-8")) == {
         "allowed_node_ids": [NODE_C]
     }
+
+
+def test_revoke_command_reports_a_symlinked_allowlist(tmp_path):
+    target = write_allowlist(tmp_path / "real.json", [NODE_A])
+    link = tmp_path / "allowlist.json"
+    link.symlink_to(target)
+    service = gateway_adapter.ChannelService(
+        key_store=transport.NodeKeyStore(path=tmp_path / "node.key"),
+        allowlist=make_allowlist(link),
+    )
+
+    text = asyncio.run(gateway_adapter.handle_revoke(service, NODE_A))
+
+    assert text == "could not update allowlist: PermissionError"
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "allowed_node_ids": [NODE_A]
+    }
+
+
+def test_revoke_command_reports_a_group_writable_allowlist(tmp_path):
+    path = write_allowlist(
+        tmp_path / "allowlist.json", [NODE_A], mode=0o664
+    )
+    original = path.read_bytes()
+    service = gateway_adapter.ChannelService(
+        key_store=transport.NodeKeyStore(path=tmp_path / "node.key"),
+        allowlist=make_allowlist(path),
+    )
+
+    text = asyncio.run(gateway_adapter.handle_revoke(service, NODE_A))
+
+    assert text == "could not update allowlist: PermissionError"
+    assert path.read_bytes() == original
+    assert file_mode(path) == 0o664

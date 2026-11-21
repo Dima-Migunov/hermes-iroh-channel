@@ -87,7 +87,21 @@ allowlisted: 3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29
 ```
 
 The entry is persisted to `allowlist.json` and applies to the next connection
-without a restart. For scripted setups, set the id up front instead:
+without a restart. To revoke access, run:
+
+```text
+/iroh_revoke <client_node_id>
+```
+
+```text
+revoked: 3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29
+```
+
+Removal applies to the node's next stream without a restart. If the id is also
+set through `HERMES_IROH_ALLOWLIST`, the command reports
+`still authorized: <normalized-id> (HERMES_IROH_ALLOWLIST)` instead; unset the
+variable to remove that source. For scripted setups, set the id up front
+instead:
 
 ```bash
 hermes config set HERMES_IROH_ALLOWLIST "<64-hex-node-id>"

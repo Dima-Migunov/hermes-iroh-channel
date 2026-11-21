@@ -223,6 +223,24 @@ async def handle_allow(service: ChannelService, args: str = "") -> str:
     return f"allowlisted: {normalized}"
 
 
+async def handle_revoke(service: ChannelService, args: str = "") -> str:
+    parts = (args or "").split()
+    if len(parts) != 1:
+        return "usage: /iroh_revoke <client_node_id>"
+    try:
+        normalized = await service.allowlist.remove(parts[0])
+    except ValueError as exc:
+        return f"invalid node id: {exc}"
+    except OSError as exc:
+        return f"could not update allowlist: {type(exc).__name__}"
+    if service.allowlist.check(normalized):
+        return (
+            f"still authorized: {normalized} "
+            f"({transport.Allowlist.ENV_VAR})"
+        )
+    return f"revoked: {normalized}"
+
+
 async def deliver_message(
     service: ChannelService,
     session: transport.StreamSession,
@@ -466,4 +484,9 @@ def register(ctx: Any) -> None:
         name="iroh_allow",
         handler=_command_handler(handle_allow),
         description="Authorize a client node id: /iroh_allow <client_node_id>",
+    )
+    ctx.register_command(
+        name="iroh_revoke",
+        handler=_command_handler(handle_revoke),
+        description="Revoke a client node id: /iroh_revoke <client_node_id>",
     )
