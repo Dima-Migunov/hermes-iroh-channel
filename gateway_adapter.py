@@ -352,20 +352,20 @@ def _model_identity(settings: Any) -> dict:
     return identity
 
 
-def _context_fields(agent: Any) -> dict:
-    compressor = _read_field(agent, "context_compressor")
+def _context_fields(source: Any) -> dict:
+    compressor = _read_field(source, "context_compressor")
     tokens = _metadata_int(
         _read_field(
             compressor,
-            "context_tokens",
             "last_prompt_tokens",
+            "context_tokens",
             "current_tokens",
             "last_real_tokens",
         )
     )
     if tokens is None:
         tokens = _metadata_int(
-            _read_field(agent, "context_tokens", "last_prompt_tokens")
+            _read_field(source, "last_prompt_tokens", "context_tokens")
         )
     length = _metadata_int(
         _read_field(
@@ -374,22 +374,19 @@ def _context_fields(agent: Any) -> dict:
     )
     if length is None:
         length = _metadata_int(
-            _read_field(agent, "context_length", "context_window")
+            _read_field(source, "context_length", "context_window")
         )
-    percent = _metadata_float(
-        _read_field(compressor, "context_percent", "used_percent")
-    )
-    if percent is None:
-        percent = _metadata_float(_read_field(agent, "context_percent"))
-    if percent is None and tokens is not None and length:
-        percent = round(tokens * 100.0 / length, 1)
+    if tokens is not None and length:
+        tokens = min(tokens, length)
     fields: dict[str, Any] = {}
     if tokens is not None:
         fields["context_tokens"] = tokens
     if length is not None:
         fields["context_length"] = length
-    if percent is not None:
-        fields["context_percent"] = percent
+    if tokens is not None and length:
+        fields["context_percent"] = max(
+            0, min(100, round(tokens * 100 / length))
+        )
     return fields
 
 
@@ -438,6 +435,22 @@ def _credits_state(agent: Any) -> Any:
         return None
 
 
+def _credits_available(credits: Any) -> bool:
+    if credits is None:
+        return False
+    if isinstance(credits, Mapping):
+        return True
+    has_data = getattr(credits, "has_data", None)
+    if has_data is True:
+        return True
+    from_header = getattr(credits, "from_header", None)
+    if from_header is True:
+        return True
+    if has_data is not None or from_header is not None:
+        return False
+    return True
+
+
 def _add_amount_pair(
     target: dict,
     source: Any,
@@ -456,45 +469,69 @@ def _add_amount_pair(
         target[usd_name] = usd
 
 
+def _binding_flag(gauge: Any) -> bool:
+    return (
+        _metadata_bool(
+            _read_field(gauge, "binding", "is_binding", "primary")
+        )
+        is True
+    )
+
+
+def _normalize_gauge(gauge: Any) -> Optional[dict]:
+    result: dict[str, Any] = {}
+    identifier = _metadata_string(_read_field(gauge, "id"))
+    label = _metadata_string(_read_field(gauge, "label"))
+    used_bp = _metadata_int(_read_field(gauge, "used_bp"))
+    resets_at_ms = _metadata_int(_read_field(gauge, "resets_at_ms"))
+    if identifier is not None:
+        result["id"] = identifier
+    if label is not None:
+        result["label"] = label
+    if used_bp is not None:
+        result["used_bp"] = used_bp
+    if resets_at_ms is not None:
+        result["resets_at_ms"] = resets_at_ms
+    return result or None
+
+
 def _plan_gauge(credits: Any) -> Optional[dict]:
     direct = _read_field(credits, "plan_gauge")
-    candidates: list[Any] = []
     if direct is not None:
-        candidates.append(direct)
-    else:
-        gauges = _read_field(credits, "plan_gauges", "gauges")
-        if isinstance(gauges, (list, tuple)):
-            binding = [
-                gauge
-                for gauge in gauges
-                if _metadata_bool(
-                    _read_field(gauge, "binding", "is_binding", "primary")
-                )
-            ]
-            candidates.extend(binding or gauges)
-    for gauge in candidates:
-        result: dict[str, Any] = {}
-        identifier = _metadata_string(_read_field(gauge, "id"))
-        label = _metadata_string(_read_field(gauge, "label"))
-        used_bp = _metadata_int(_read_field(gauge, "used_bp"))
-        resets_at_ms = _metadata_int(_read_field(gauge, "resets_at_ms"))
-        if identifier is not None:
-            result["id"] = identifier
-        if label is not None:
-            result["label"] = label
-        if used_bp is not None:
-            result["used_bp"] = used_bp
-        if resets_at_ms is not None:
-            result["resets_at_ms"] = resets_at_ms
-        if result:
-            return result
-    return None
+        return _normalize_gauge(direct)
+    gauges = _read_field(credits, "gauges")
+    if not isinstance(gauges, (list, tuple)):
+        gauges = _read_field(credits, "plan_gauges")
+    if not isinstance(gauges, (list, tuple)) or not gauges:
+        return None
+    binding = _read_field(credits, "binding_gauge")
+    if binding is None:
+        binding = next(
+            (gauge for gauge in gauges if _binding_flag(gauge)), None
+        )
+    full = _read_field(binding, "full") if binding is not None else None
+    if full is None and binding is not None:
+        used_bp = _metadata_int(_read_field(binding, "used_bp"))
+        full = used_bp is not None and used_bp >= 10000
+    day = next(
+        (
+            gauge
+            for gauge in gauges
+            if _read_field(gauge, "id") == "day"
+            and _read_field(gauge, "scope") == "all"
+        ),
+        None,
+    )
+    chosen = binding if binding is not None and full else (day or binding)
+    if chosen is None:
+        chosen = gauges[0]
+    return _normalize_gauge(chosen)
 
 
 def _account_balance(
     credits: Any, fallback_provider: Optional[str]
 ) -> dict:
-    if credits is None:
+    if not _credits_available(credits):
         return {}
     fields: dict[str, Any] = {}
     _add_amount_pair(fields, credits, "remaining_usd", "remaining_micros")
@@ -513,7 +550,7 @@ def _account_balance(
     if paid_access is not None:
         fields["paid_access"] = paid_access
     as_of_ms = _metadata_int(_read_field(credits, "as_of_ms"))
-    if as_of_ms is not None:
+    if as_of_ms:
         fields["as_of_ms"] = as_of_ms
     gauge = _plan_gauge(credits)
     if gauge is not None:
@@ -529,12 +566,33 @@ def _account_balance(
     return balance
 
 
+def _captured_session_usage(stats: Any) -> dict:
+    if not isinstance(stats, Mapping):
+        return {}
+    usage: dict[str, Any] = {}
+    for name, aliases in _USAGE_FIELDS:
+        value = _metadata_int(_read_field(stats, *aliases))
+        if value is not None:
+            usage[name] = value
+    if "total_tokens" not in usage:
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        if input_tokens is not None and output_tokens is not None:
+            usage["total_tokens"] = input_tokens + output_tokens
+    api_calls = _metadata_int(_read_field(stats, "api_calls"))
+    if api_calls is not None:
+        usage["api_calls"] = api_calls
+    usage.update(_context_fields(stats))
+    return usage
+
+
 def build_metadata(
     *,
     generated_at: str,
     latency_ms: int,
     model_settings: Any = None,
     turn_usage: Any = None,
+    session_stats: Any = None,
     agent: Any = None,
 ) -> dict:
     metadata: dict[str, Any] = {
@@ -548,6 +606,7 @@ def build_metadata(
     if usage:
         metadata["usage"] = usage
     session_usage = _session_usage(agent)
+    session_usage.update(_captured_session_usage(session_stats))
     if session_usage:
         metadata["session_usage"] = session_usage
     balance = _account_balance(
@@ -610,6 +669,10 @@ async def _session_model_settings(adapter: Any, source: Any) -> Any:
 
 
 def _turn_agent(state: Any) -> Any:
+    turn = _read_field(state, "turn")
+    agent = _read_field(turn, "agent")
+    if agent is not None:
+        return agent
     for name in ("turn_agent", "agent", "cached_agent", "active_agent"):
         agent = _read_field(state, name)
         if agent is not None:
@@ -617,20 +680,47 @@ def _turn_agent(state: Any) -> Any:
     return None
 
 
+def _usable_agent(agent: Any) -> bool:
+    if agent is None:
+        return False
+    try:
+        from gateway.run import _AGENT_PENDING_SENTINEL
+    except Exception:
+        return True
+    return agent is not _AGENT_PENDING_SENTINEL
+
+
+def _lookup(lookup: Any, key: Any) -> Any:
+    if not callable(lookup):
+        return None
+    try:
+        return lookup(key)
+    except Exception:
+        return None
+
+
 def _live_agent(adapter: Any, source: Any) -> Any:
     runner = getattr(adapter, "gateway_runner", None)
     if runner is None or source is None:
         return None
     key_for_source = getattr(runner, "_session_key_for_source", None)
-    peek_state = getattr(runner, "_peek_session_state", None)
-    if not callable(key_for_source) or not callable(peek_state):
+    if not callable(key_for_source):
         return None
     try:
         key = key_for_source(source)
-        state = peek_state(key)
     except Exception:
         return None
-    return _turn_agent(state)
+    resident = _lookup(getattr(runner, "_resident_agent_for", None), key)
+    if _usable_agent(resident):
+        return resident
+    state = _lookup(getattr(runner, "_peek_session_state", None), key)
+    agent = _turn_agent(state)
+    if _usable_agent(agent):
+        return agent
+    cached = _lookup(getattr(runner, "_cached_agent_for", None), key)
+    if _usable_agent(cached):
+        return cached
+    return None
 
 
 def _execution_holder_value(holder: Any) -> Any:
@@ -655,13 +745,16 @@ def _execution_holder_value(holder: Any) -> Any:
     return holder
 
 
-def _execution_usage() -> Any:
+def _execution_payload() -> Any:
     try:
         from gateway import session_results
     except Exception:
         return None
     holder = getattr(session_results, "execution_result", None)
-    value = _execution_holder_value(holder)
+    return _execution_holder_value(holder)
+
+
+def _execution_usage(value: Any) -> Any:
     usage = _read_field(value, "usage")
     if usage is not None:
         return usage
@@ -676,11 +769,13 @@ async def collect_response_metadata(
 ) -> dict:
     source = _session_source(adapter, session)
     model_settings = await _session_model_settings(adapter, source)
+    execution = _execution_payload()
     return build_metadata(
         generated_at=_utc_timestamp(now),
         latency_ms=_session_latency_ms(session),
         model_settings=model_settings,
-        turn_usage=_execution_usage(),
+        turn_usage=_execution_usage(execution),
+        session_stats=_read_field(execution, "session_usage"),
         agent=_live_agent(adapter, source),
     )
 

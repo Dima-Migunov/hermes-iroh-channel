@@ -417,7 +417,7 @@ optional: a client that only understands `type` still completes the response, an
 the frame is exactly `{"type":"done"}` when no metadata is available.
 
 ```json
-{"type":"done","metadata":{"schema":1,"generated_at":"2026-11-21T12:00:00.000Z","latency_ms":812,"model":"gpt-5.1","provider":"openai","usage":{"input_tokens":1200,"output_tokens":300,"total_tokens":1500},"session_usage":{"input_tokens":10200,"output_tokens":2400,"total_tokens":12600,"api_calls":8,"context_tokens":8400,"context_length":128000,"context_percent":6.6},"balance":{"provider":"nous","remaining_micros":12500000,"remaining_usd":12.5,"paid_access":true,"as_of_ms":1763726400000}}}
+{"type":"done","metadata":{"schema":1,"generated_at":"2026-11-21T12:00:00.000Z","latency_ms":812,"model":"gpt-5.1","provider":"openai","usage":{"input_tokens":1200,"output_tokens":300,"total_tokens":1500},"session_usage":{"input_tokens":10200,"output_tokens":2400,"total_tokens":12600,"api_calls":8,"context_tokens":8400,"context_length":128000,"context_percent":7},"balance":{"provider":"nous","remaining_micros":12500000,"remaining_usd":12.5,"paid_access":true,"as_of_ms":1763726400000}}}
 ```
 
 | Field | Type | Meaning |
@@ -428,7 +428,7 @@ the frame is exactly `{"type":"done"}` when no metadata is available.
 | `model` | string | Model that produced the turn, when Hermes reports it |
 | `provider` | string | Provider for that model, when Hermes reports it |
 | `usage` | object | Per-turn token counts: `input_tokens`, `output_tokens`, `total_tokens`, and `reasoning_tokens`, `cache_read_tokens`, `cache_write_tokens` when available |
-| `session_usage` | object | Cumulative conversation counters: `input_tokens`, `output_tokens`, `total_tokens`, `api_calls`, `estimated_cost_usd`, `cost_status`, `cost_source`, and the context fields `context_tokens`, `context_length`, `context_percent` when available |
+| `session_usage` | object | Cumulative conversation counters: `input_tokens`, `output_tokens`, `total_tokens`, `api_calls`, `estimated_cost_usd`, `cost_status`, `cost_source`, and the context fields `context_tokens` (tokens in use), `context_length` (window size), `context_percent` (integer 0-100) when available |
 | `balance` | object | Account view: `provider`, `remaining_micros`, `remaining_usd`, `subscription_micros`, `subscription_usd`, `subscription_limit_usd`, `purchased_micros`, `purchased_usd`, `paid_access`, `as_of_ms`, and an optional `plan_gauge` with `id`, `label`, `used_bp`, `resets_at_ms` |
 
 - `schema`, `generated_at`, and `latency_ms` are always present on a metadata

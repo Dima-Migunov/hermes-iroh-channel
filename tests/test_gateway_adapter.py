@@ -222,25 +222,24 @@ def test_metadata_reads_live_agent_counters_cost_and_context():
         "cost_source": "model_catalog",
         "context_tokens": 8400,
         "context_length": 128000,
-        "context_percent": 6.6,
+        "context_percent": 7,
     }
 
 
-def test_metadata_uses_a_reported_context_percent():
+def test_metadata_clamps_context_usage_to_the_window():
     agent = SimpleNamespace(
         context_compressor=SimpleNamespace(
-            context_tokens=1000,
-            context_length=8000,
-            context_percent=12.5,
+            last_prompt_tokens=200000,
+            context_length=128000,
         )
     )
 
     metadata = metadata_from(agent=agent)
 
     assert metadata["session_usage"] == {
-        "context_tokens": 1000,
-        "context_length": 8000,
-        "context_percent": 12.5,
+        "context_tokens": 128000,
+        "context_length": 128000,
+        "context_percent": 100,
     }
 
 
@@ -321,6 +320,92 @@ def test_metadata_uses_the_turn_provider_when_credits_omit_it():
 
     assert metadata["balance"]["provider"] == "openai"
     assert metadata["balance"]["as_of_ms"] == 1763726400000
+
+
+def test_metadata_reads_a_hermes_credits_state_and_gauge():
+    day = SimpleNamespace(
+        id="day",
+        scope="all",
+        label="Daily",
+        used_bp=2500,
+        resets_at_ms=4102444800000,
+    )
+    binding = SimpleNamespace(
+        id="month",
+        scope="all",
+        label="Monthly",
+        used_bp=9000,
+        resets_at_ms=4102444800000,
+        full=False,
+    )
+    credits = SimpleNamespace(
+        remaining_micros=12_500_000,
+        subscription_micros=2_000_000,
+        subscription_limit_micros=10_000_000,
+        purchased_micros=1_000_000,
+        paid_access=True,
+        as_of_ms=1763726400000,
+        has_data=True,
+        from_header=False,
+        gauges=(day, binding),
+        binding_gauge=binding,
+    )
+
+    metadata = metadata_from(agent=SimpleNamespace(_credits_state=credits))
+
+    assert metadata["balance"]["remaining_usd"] == 12.5
+    assert metadata["balance"]["subscription_limit_usd"] == 10.0
+    assert metadata["balance"]["plan_gauge"] == {
+        "id": "day",
+        "label": "Daily",
+        "used_bp": 2500,
+        "resets_at_ms": 4102444800000,
+    }
+
+
+def test_metadata_prefers_a_full_binding_gauge():
+    day = SimpleNamespace(
+        id="day", scope="all", label="Daily", used_bp=2500
+    )
+    binding = SimpleNamespace(
+        id="month",
+        scope="all",
+        label="Monthly",
+        used_bp=10000,
+        resets_at_ms=4102444800000,
+        full=True,
+    )
+    credits = SimpleNamespace(
+        remaining_micros=1_000_000,
+        has_data=True,
+        gauges=(day, binding),
+        binding_gauge=binding,
+    )
+
+    metadata = metadata_from(agent=SimpleNamespace(_credits_state=credits))
+
+    assert metadata["balance"]["plan_gauge"] == {
+        "id": "month",
+        "label": "Monthly",
+        "used_bp": 10000,
+        "resets_at_ms": 4102444800000,
+    }
+
+
+def test_metadata_omits_balance_before_credits_are_captured():
+    credits = SimpleNamespace(
+        remaining_micros=0,
+        subscription_micros=0,
+        purchased_micros=0,
+        paid_access=True,
+        as_of_ms=0,
+        has_data=False,
+        from_header=False,
+    )
+
+    metadata = metadata_from(agent=SimpleNamespace(_credits_state=credits))
+
+    assert "balance" not in metadata
 
 
 def test_metadata_omits_unavailable_and_invalid_values():
@@ -1273,7 +1358,9 @@ async def test_duplicate_finalization_collects_metadata_once(tmp_path):
 def test_turn_agent_prefers_the_turn_agent_over_the_cached_agent():
     turn_agent = SimpleNamespace(session_input_tokens=1)
     cached_agent = SimpleNamespace(session_input_tokens=2)
+    state = SimpleNamespace(turn=SimpleNamespace(agent=turn_agent))
 
+    assert gateway_adapter._turn_agent(state) is turn_agent
     assert gateway_adapter._turn_agent(
         {"turn_agent": turn_agent, "cached_agent": cached_agent}
     ) is turn_agent
@@ -1281,6 +1368,91 @@ def test_turn_agent_prefers_the_turn_agent_over_the_cached_agent():
         {"cached_agent": cached_agent}
     ) is cached_agent
     assert gateway_adapter._turn_agent(object()) is None
+
+
+async def test_metadata_reads_context_from_the_resident_agent(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=8400,
+            context_length=128000,
+        )
+    )
+
+    class Runner:
+        def _session_key_for_source(self, source):
+            return source.chat_id
+
+        def _resident_agent_for(self, key):
+            return agent
+
+    adapter.gateway_runner = Runner()
+
+    await adapter.send(session.chat_id, "answer", metadata={"notify": True})
+
+    session_usage = send.frames()[-1]["metadata"]["session_usage"]
+    assert session_usage["context_tokens"] == 8400
+    assert session_usage["context_length"] == 128000
+    assert session_usage["context_percent"] == 7
+
+
+async def test_metadata_reads_context_from_a_peeked_session_state(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=3200,
+            context_length=12800,
+        )
+    )
+
+    class Runner:
+        def _session_key_for_source(self, source):
+            return source.chat_id
+
+        def _peek_session_state(self, key):
+            return SimpleNamespace(turn=SimpleNamespace(agent=agent))
+
+    adapter.gateway_runner = Runner()
+
+    await adapter.send(session.chat_id, "answer", metadata={"notify": True})
+
+    session_usage = send.frames()[-1]["metadata"]["session_usage"]
+    assert session_usage["context_tokens"] == 3200
+    assert session_usage["context_length"] == 12800
+    assert session_usage["context_percent"] == 25
+
+
+async def test_metadata_falls_back_to_the_cached_agent(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=1000,
+            context_length=4000,
+        )
+    )
+
+    class Runner:
+        def _session_key_for_source(self, source):
+            return source.chat_id
+
+        def _peek_session_state(self, key):
+            return None
+
+        def _cached_agent_for(self, key):
+            return agent
+
+    adapter.gateway_runner = Runner()
+
+    await adapter.send(session.chat_id, "answer", metadata={"notify": True})
+
+    session_usage = send.frames()[-1]["metadata"]["session_usage"]
+    assert session_usage["context_percent"] == 25
 
 
 async def test_concurrent_sessions_get_isolated_metadata(tmp_path):
@@ -1409,6 +1581,59 @@ async def test_metadata_reads_turn_usage_from_the_gateway_execution_result(
         "input_tokens": 11,
         "output_tokens": 4,
         "total_tokens": 15,
+    }
+
+
+async def test_metadata_uses_captured_session_stats_when_available(
+    tmp_path, monkeypatch
+):
+    import contextvars
+    import types
+
+    gateway_module = types.ModuleType("gateway")
+    session_results = types.ModuleType("gateway.session_results")
+    execution_result = contextvars.ContextVar("execution_result")
+    execution_result.set(
+        {
+            "usage": {"input_tokens": 20, "output_tokens": 8},
+            "session_usage": {
+                "input_tokens": 2000,
+                "output_tokens": 500,
+                "total_tokens": 2500,
+                "api_calls": 3,
+                "last_prompt_tokens": 2000,
+                "context_tokens": 2000,
+                "context_length": 8000,
+            },
+        }
+    )
+    session_results.execution_result = execution_result
+    gateway_module.session_results = session_results
+    monkeypatch.setitem(sys.modules, "gateway", gateway_module)
+    monkeypatch.setitem(
+        sys.modules, "gateway.session_results", session_results
+    )
+
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+
+    await adapter.send(session.chat_id, "answer", metadata={"notify": True})
+
+    metadata = send.frames()[-1]["metadata"]
+    assert metadata["usage"] == {
+        "input_tokens": 20,
+        "output_tokens": 8,
+        "total_tokens": 28,
+    }
+    assert metadata["session_usage"] == {
+        "input_tokens": 2000,
+        "output_tokens": 500,
+        "total_tokens": 2500,
+        "api_calls": 3,
+        "context_tokens": 2000,
+        "context_length": 8000,
+        "context_percent": 25,
     }
 
 
