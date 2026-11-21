@@ -214,6 +214,52 @@ async def test_start_is_idempotent():
     assert [frame["type"] for frame in send.frames()] == ["start"]
 
 
+async def test_response_cap_sends_one_terminal_error_and_stops():
+    session, send = make_session(max_response_bytes=5)
+    await session.start()
+
+    await session.append("abcd")
+    await session.append("ef")
+    await session.append("ignored")
+
+    assert send.frames() == [
+        {"type": "start", "session_id": "default"},
+        {"type": "delta", "content": "abcd"},
+        {"type": "error", "message": transport.ERR_RESPONSE_TOO_LARGE},
+    ]
+    assert session.terminal is True
+    assert send.closed is True
+    assert session.bytes_sent == 4
+
+
+async def test_response_cap_counts_utf8_bytes():
+    session, send = make_session(max_response_bytes=4)
+    await session.start()
+
+    await session.append("é")
+    await session.append("é")
+    await session.append("é")
+
+    assert [frame["type"] for frame in send.frames()] == [
+        "start",
+        "delta",
+        "delta",
+        "error",
+    ]
+    assert send.frames()[-1]["message"] == transport.ERR_RESPONSE_TOO_LARGE
+
+
+async def test_response_cap_must_be_positive():
+    with pytest.raises(ValueError):
+        transport.StreamSession(
+            FakeSend(),
+            node_id="n" * 64,
+            session_id="default",
+            chat_id="chat",
+            max_response_bytes=0,
+        )
+
+
 async def test_session_tracks_delta_statistics():
     session, _send = make_session()
     await session.start()

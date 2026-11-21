@@ -50,22 +50,93 @@ def test_comma_separated_urls_are_trimmed():
 
 
 @pytest.mark.parametrize(
-    "value",
+    ("value", "reason"),
     [
-        "relay.example.com",
-        "https://",
-        "not a url",
-        "https://a.example.com,,https://b.example.com",
-        "https://a.example.com,",
-        "ftp://relay.example.com",
+        ("relay.example.com", "entry 1 must use the http or https scheme"),
+        ("https://", "entry 1 has no hostname"),
+        (
+            "not a url",
+            "entry 1 contains whitespace or control characters",
+        ),
+        (
+            "https://a.example.com,,https://b.example.com",
+            "entry 2 is empty",
+        ),
+        ("https://a.example.com,", "entry 2 is empty"),
+        ("ftp://relay.example.com", "entry 1 must use the http or https scheme"),
+        ("https://:443", "entry 1 has no hostname"),
+        (
+            "https://relay.example.com:notaport",
+            "entry 1 has an invalid port",
+        ),
+        (
+            "https://exa mple.com",
+            "entry 1 contains whitespace or control characters",
+        ),
     ],
 )
-def test_invalid_values_fail_with_diagnostic(value):
+def test_invalid_values_fail_with_position_and_reason(value, reason):
     with pytest.raises(transport.RelayConfigError) as excinfo:
         transport.parse_relay_setting(value)
 
-    assert "HERMES_IROH_RELAY" in str(excinfo.value)
-    assert value.strip() in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "HERMES_IROH_RELAY" in message
+    assert reason in message
+    assert value.strip() not in message
+
+
+def test_relay_credentials_are_refused_without_echoing_them():
+    with pytest.raises(transport.RelayConfigError) as excinfo:
+        transport.parse_relay_setting(
+            "https://user:secret@relay.example.com"
+        )
+
+    message = str(excinfo.value)
+    assert "entry 1 must not include userinfo" in message
+    assert "user:" not in message
+    assert "secret" not in message
+    assert "relay.example.com" not in message
+
+
+def test_describe_redacts_userinfo_query_and_fragment():
+    config = transport.RelayConfig(
+        "raw",
+        "custom",
+        ("https://user:secret@relay.example.com:8443/path?token=abc#frag",),
+    )
+
+    assert config.describe() == "https://relay.example.com:8443/path"
+
+
+def test_describe_redacts_a_query_string():
+    config = transport.parse_relay_setting(
+        "https://relay.example.com/path?token=abc"
+    )
+
+    assert config.describe() == "https://relay.example.com/path"
+    assert "token" not in config.describe()
+
+
+def test_build_relay_mode_error_does_not_echo_the_setting(monkeypatch):
+    class FailingRelayMode:
+        @staticmethod
+        def custom_from_urls(urls):
+            raise RuntimeError(f"rejected {urls[0]}")
+
+    fake_iroh = type(sys)("iroh")
+    fake_iroh.RelayMode = FailingRelayMode
+    monkeypatch.setitem(sys.modules, "iroh", fake_iroh)
+    config = transport.parse_relay_setting(
+        "https://relay.example.com/path?token=abc"
+    )
+
+    with pytest.raises(transport.RelayConfigError) as excinfo:
+        transport.build_relay_mode(config)
+
+    message = str(excinfo.value)
+    assert "token" not in message
+    assert "relay.example.com" not in message
+    assert "RuntimeError" in message
 
 
 @requires_iroh

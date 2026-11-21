@@ -7,15 +7,26 @@ in a plain Python environment. The transport contract it consumes lives in
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import os
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 try:
     from . import transport
 except ImportError:
     import transport
+
+    _transport_path = getattr(transport, "__file__", None)
+    if _transport_path is None or (
+        Path(_transport_path).resolve().parent
+        != Path(__file__).resolve().parent
+    ):
+        raise ImportError(
+            "refusing to load transport from outside the plugin directory"
+        ) from None
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +92,7 @@ class ChannelService:
         self.key_store = key_store or transport.NodeKeyStore()
         self.allowlist = allowlist or transport.Allowlist()
         self.server: Optional[transport.ChannelServer] = None
+        self._lifecycle_lock: Optional[asyncio.Lock] = None
         self.router = ResponseRouter()
 
     @classmethod
@@ -94,20 +106,42 @@ class ChannelService:
         cls._instance = None
 
     async def start(self) -> transport.ChannelServer:
-        if self.server is not None and self.server.running:
-            return self.server
-        self.server = transport.ChannelServer(
-            key_store=self.key_store,
-            allowlist=self.allowlist,
-            turn_timeout=transport.turn_timeout_from_env(),
-        )
-        await self.server.start()
-        return self.server
+        if self._lifecycle_lock is None:
+            self._lifecycle_lock = asyncio.Lock()
+        async with self._lifecycle_lock:
+            if self.server is not None and self.server.running:
+                return self.server
+            limits = transport.server_limits_from_env()
+            server = transport.ChannelServer(
+                key_store=self.key_store,
+                allowlist=self.allowlist,
+                turn_timeout=transport.turn_timeout_from_env(),
+                on_session_end=self._release_session_state,
+                max_pending_handshakes=limits.max_pending_handshakes,
+                max_streams_per_node=limits.max_streams_per_node,
+                max_prompts_per_minute=limits.max_prompts_per_minute,
+                max_response_bytes=limits.max_response_bytes,
+            )
+            await server.start()
+            self.server = server
+            return server
 
     async def stop(self) -> None:
-        server, self.server = self.server, None
-        if server is not None:
-            await server.stop()
+        if self._lifecycle_lock is None:
+            self._lifecycle_lock = asyncio.Lock()
+        async with self._lifecycle_lock:
+            server, self.server = self.server, None
+            if server is not None:
+                await server.stop()
+
+    def _release_session_state(self, session: transport.StreamSession) -> None:
+        current = (
+            self.server.session_for(session.chat_id)
+            if self.server is not None
+            else None
+        )
+        if current is None or current is session:
+            self.router.release(session.chat_id)
 
     def node_id(self) -> str:
         return self.key_store.node_id()
@@ -315,8 +349,7 @@ def build_adapter_class(
                 finalize = False
             elif not finalize and not meta.get("expect_edits") and session.slash_prompt:
                 finalize = True
-            await deliver_message(service, session, content, finalize=finalize)
-            return send_result(success=True, message_id=session.chat_id)
+            return await self._deliver(chat_id, content, finalize=finalize)
 
         async def edit_message(
             self,
@@ -327,6 +360,11 @@ def build_adapter_class(
             finalize: bool = False,
         ) -> Any:
             del message_id
+            return await self._deliver(chat_id, content, finalize=finalize)
+
+        async def _deliver(
+            self, chat_id: str, content: str, *, finalize: bool
+        ) -> Any:
             session = self._session(chat_id)
             if session is None:
                 return _no_active_stream_result(send_result)

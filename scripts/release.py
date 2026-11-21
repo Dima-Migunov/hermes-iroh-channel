@@ -30,10 +30,24 @@ CONVENTIONAL_SUBJECT = re.compile(
 BREAKING_FOOTER = re.compile(r"(?m)^BREAKING[ -]CHANGE:")
 RELEASE_SUBJECT = re.compile(r"^chore: release v\d+\.\d+\.\d+$")
 PART_ORDER = ("patch", "minor", "major")
+GITHUB_API = "https://api.github.com"
 
 
 class ReleaseError(Exception):
     """A release precondition failed or a release step could not complete."""
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so the Authorization header is never forwarded."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, "redirect refused", headers, fp
+        )
+
+
+def build_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(_NoRedirectHandler)
 
 
 def git(*args: str) -> str:
@@ -257,7 +271,7 @@ def create_release(
         }
     ).encode("utf-8")
     request = urllib.request.Request(
-        f"https://api.github.com/repos/{slug}/releases",
+        f"{GITHUB_API}/repos/{slug}/releases",
         data=payload,
         method="POST",
         headers={
@@ -268,7 +282,7 @@ def create_release(
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with build_opener().open(request, timeout=30) as response:
             data = json.load(response)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")

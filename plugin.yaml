@@ -29,3 +29,19 @@ optional_env:
     description: "Seconds to wait for a gateway turn before the stream fails with timeout"
     prompt: Turn timeout in seconds (default 600)
     password: false
+  - name: HERMES_IROH_MAX_PENDING_HANDSHAKES
+    description: "Concurrent incoming handshakes admitted before excess connections are refused"
+    prompt: Maximum pending handshakes (default 32)
+    password: false
+  - name: HERMES_IROH_MAX_STREAMS_PER_NODE
+    description: "Concurrent prompts allowed per authenticated client node id"
+    prompt: Maximum concurrent streams per node (default 2)
+    password: false
+  - name: HERMES_IROH_MAX_PROMPTS_PER_MINUTE
+    description: "Prompts allowed per authenticated client node id in a 60-second window"
+    prompt: Maximum prompts per node per minute (default 30)
+    password: false
+  - name: HERMES_IROH_MAX_RESPONSE_BYTES
+    description: "Response content bytes forwarded per turn before response_too_large"
+    prompt: Maximum response bytes per turn (default 4194304)
+    password: false

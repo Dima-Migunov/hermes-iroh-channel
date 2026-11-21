@@ -8,16 +8,20 @@ Hermes gateway adapter lives in ``gateway_adapter.py``.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
+import math
 import os
 import re
+import stat
 import tempfile
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +34,20 @@ PROMPT_READ_CHUNK = 4096
 
 PROMPT_TIMEOUT = 30.0
 DEFAULT_TURN_TIMEOUT = 600.0
+MIN_TURN_TIMEOUT = 1.0
+MAX_TURN_TIMEOUT = 86400.0
 DEFAULT_MAX_CONNECTIONS = 64
 DEFAULT_MAX_STREAMS_PER_CONNECTION = 8
 DEFAULT_MAX_TOTAL_STREAMS = 64
+DEFAULT_MAX_PENDING_HANDSHAKES = 32
+DEFAULT_MAX_STREAMS_PER_NODE = 2
+DEFAULT_MAX_PROMPTS_PER_MINUTE = 30
+DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_RECORDED_REJECTIONS = 32
+PROMPT_RATE_WINDOW = 60.0
+REJECTION_LOG_INTERVAL = 5.0
+ACCEPT_BACKOFF_MIN = 0.05
+ACCEPT_BACKOFF_MAX = 5.0
 
 ERR_INVALID_PROMPT = "invalid_prompt"
 ERR_PROMPT_TOO_LARGE = "prompt_too_large"
@@ -42,6 +56,8 @@ ERR_TIMEOUT = "timeout"
 ERR_UNAUTHORIZED = "unauthorized"
 ERR_INTERNAL = "internal_error"
 ERR_TOO_MANY_STREAMS = "too_many_streams"
+ERR_RATE_LIMITED = "rate_limited"
+ERR_RESPONSE_TOO_LARGE = "response_too_large"
 
 ERROR_VALUES = frozenset(
     {
@@ -52,12 +68,17 @@ ERROR_VALUES = frozenset(
         ERR_UNAUTHORIZED,
         ERR_INTERNAL,
         ERR_TOO_MANY_STREAMS,
+        ERR_RATE_LIMITED,
+        ERR_RESPONSE_TOO_LARGE,
     }
 )
 
 SECRET_KEY_BYTES = 32
+ALLOWLIST_MAX_BYTES = 1024 * 1024
+MAX_KEY_READ_BYTES = SECRET_KEY_BYTES + 1
 
 _NODE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_SESSION_ID_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9_.-]{1,128}$")
 _DISABLED_RELAY_VALUES = frozenset({"disabled", "off", "none"})
 
 
@@ -71,6 +92,10 @@ class KeyStoreError(TransportError):
 
 class RelayConfigError(TransportError):
     """The relay override cannot be parsed."""
+
+
+class FileSafetyError(TransportError):
+    """A state file failed the ownership, mode, or size checks."""
 
 
 class PromptError(TransportError):
@@ -118,11 +143,155 @@ def turn_timeout_from_env(default: float = DEFAULT_TURN_TIMEOUT) -> float:
         raise TransportError(
             f"HERMES_IROH_TURN_TIMEOUT is not a number: {raw!r}"
         ) from exc
-    if value <= 0:
+    if not math.isfinite(value):
         raise TransportError(
-            f"HERMES_IROH_TURN_TIMEOUT must be positive: {raw!r}"
+            f"HERMES_IROH_TURN_TIMEOUT must be finite: {raw!r}"
+        )
+    if value < MIN_TURN_TIMEOUT or value > MAX_TURN_TIMEOUT:
+        raise TransportError(
+            "HERMES_IROH_TURN_TIMEOUT must be between "
+            f"{MIN_TURN_TIMEOUT:g} and {MAX_TURN_TIMEOUT:g} seconds: {raw!r}"
         )
     return value
+
+
+@dataclass(frozen=True)
+class ServerLimits:
+    """Admission and quota limits applied by ``ChannelServer``."""
+
+    max_pending_handshakes: int = DEFAULT_MAX_PENDING_HANDSHAKES
+    max_streams_per_node: int = DEFAULT_MAX_STREAMS_PER_NODE
+    max_prompts_per_minute: int = DEFAULT_MAX_PROMPTS_PER_MINUTE
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
+
+
+def _positive_int_from_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise TransportError(f"{name} is not an integer: {raw!r}") from exc
+    if value <= 0:
+        raise TransportError(f"{name} must be positive: {raw!r}")
+    return value
+
+
+def server_limits_from_env() -> ServerLimits:
+    return ServerLimits(
+        max_pending_handshakes=_positive_int_from_env(
+            "HERMES_IROH_MAX_PENDING_HANDSHAKES",
+            DEFAULT_MAX_PENDING_HANDSHAKES,
+        ),
+        max_streams_per_node=_positive_int_from_env(
+            "HERMES_IROH_MAX_STREAMS_PER_NODE",
+            DEFAULT_MAX_STREAMS_PER_NODE,
+        ),
+        max_prompts_per_minute=_positive_int_from_env(
+            "HERMES_IROH_MAX_PROMPTS_PER_MINUTE",
+            DEFAULT_MAX_PROMPTS_PER_MINUTE,
+        ),
+        max_response_bytes=_positive_int_from_env(
+            "HERMES_IROH_MAX_RESPONSE_BYTES",
+            DEFAULT_MAX_RESPONSE_BYTES,
+        ),
+    )
+
+
+def _sync_directory(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _file_safety_problem(
+    info: os.stat_result, *, require_owner_only: bool
+) -> Optional[str]:
+    if not stat.S_ISREG(info.st_mode):
+        return "is not a regular file"
+    if not hasattr(os, "getuid"):
+        return None
+    if info.st_uid != os.getuid():
+        return "is not owned by the current user"
+    if require_owner_only:
+        if info.st_mode & 0o077:
+            return "must not grant group or other permissions (require 0600)"
+    elif info.st_mode & 0o022:
+        return "must not be group- or world-writable"
+    return None
+
+
+def _read_safe_bytes(
+    path: Path, *, max_bytes: int, require_owner_only: bool
+) -> bytes:
+    if path.is_symlink():
+        raise FileSafetyError("is a symbolic link")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as exc:
+        raise FileSafetyError(
+            f"{type(exc).__name__} while opening"
+        ) from exc
+    try:
+        info = os.fstat(fd)
+        problem = _file_safety_problem(
+            info, require_owner_only=require_owner_only
+        )
+        if problem is not None:
+            raise FileSafetyError(problem)
+        if info.st_size > max_bytes:
+            raise FileSafetyError(f"exceeds the {max_bytes}-byte limit")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, max_bytes + 1 - total))
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > max_bytes:
+                raise FileSafetyError(f"exceeds the {max_bytes}-byte limit")
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+
+
+def _require_safe_state_directory(path: Path) -> None:
+    resolved = path.resolve()
+    try:
+        info = resolved.stat()
+    except OSError as exc:
+        raise PermissionError(
+            f"{path}: state directory cannot be checked "
+            f"({type(exc).__name__}); set HERMES_IROH_STATE_DIR to a private "
+            "directory"
+        ) from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise PermissionError(
+            f"{path}: state directory is not a directory; set "
+            "HERMES_IROH_STATE_DIR to a private directory"
+        )
+    if not hasattr(os, "getuid"):
+        return
+    if info.st_uid != os.getuid():
+        raise PermissionError(
+            f"{path}: state directory is not owned by the current user; "
+            f"set HERMES_IROH_STATE_DIR to a private directory"
+        )
+    if info.st_mode & 0o022:
+        raise PermissionError(
+            f"{path}: state directory must not be group- or world-writable; "
+            f"run chmod 700 {path} or set HERMES_IROH_STATE_DIR to a private "
+            "directory"
+        )
 
 
 def _write_file_atomic(path: Path, payload: bytes, *, prefix: str) -> None:
@@ -134,21 +303,32 @@ def _write_file_atomic(path: Path, payload: bytes, *, prefix: str) -> None:
             os.chmod(parent, 0o700)
         except OSError:
             logger.debug("could not set 0700 on %s", parent)
+    _require_safe_state_directory(parent)
     fd, tmp = tempfile.mkstemp(dir=str(parent), prefix=prefix, suffix=".tmp")
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        try:
+            os.fchmod(fd, 0o600)
+            handle = os.fdopen(fd, "wb")
+            fd = -1
+            with handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
-    NodeKeyStore._sync_directory(parent)
+    _sync_directory(parent)
 
 
 class IrohSecretBackend:
@@ -186,12 +366,16 @@ class NodeKeyStore:
     def load_or_create(self) -> Any:
         if self._secret is not None:
             return self._secret
-        if self.path.exists():
+        if self.path.exists() or self.path.is_symlink():
             try:
-                raw = self.path.read_bytes()
-            except OSError as exc:
+                raw = _read_safe_bytes(
+                    self.path,
+                    max_bytes=MAX_KEY_READ_BYTES,
+                    require_owner_only=True,
+                )
+            except FileSafetyError as exc:
                 raise KeyStoreError(
-                    f"{self.path}: cannot read node key ({type(exc).__name__})"
+                    f"{self.path}: cannot read node key ({exc})"
                 ) from exc
             if len(raw) != SECRET_KEY_BYTES:
                 raise KeyStoreError(
@@ -222,19 +406,6 @@ class NodeKeyStore:
     def _write_atomic(self, raw: bytes) -> None:
         _write_file_atomic(self.path, raw, prefix=".node.key.")
 
-    @staticmethod
-    def _sync_directory(path: Path) -> None:
-        try:
-            fd = os.open(str(path), os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(fd)
-        except OSError:
-            pass
-        finally:
-            os.close(fd)
-
 
 @dataclass(frozen=True)
 class RelayConfig:
@@ -248,8 +419,55 @@ class RelayConfig:
         if self.kind == "disabled":
             return "disabled"
         if self.kind == "custom":
-            return ",".join(self.urls)
+            return ",".join(_redacted_relay_url(url) for url in self.urls)
         return "default"
+
+
+def _redacted_relay_url(url: str) -> str:
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = parsed.port
+    netloc = f"{host}:{port}" if port is not None else host
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _validate_relay_url(url: str, position: int) -> None:
+    if any(
+        character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
+        for character in url
+    ):
+        raise RelayConfigError(
+            f"HERMES_IROH_RELAY entry {position} contains whitespace or "
+            "control characters"
+        )
+    try:
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise RelayConfigError(
+            f"HERMES_IROH_RELAY entry {position} is not a valid URL "
+            f"({type(exc).__name__})"
+        ) from exc
+    if parsed.scheme not in ("http", "https"):
+        raise RelayConfigError(
+            f"HERMES_IROH_RELAY entry {position} must use the http or https "
+            "scheme"
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise RelayConfigError(
+            f"HERMES_IROH_RELAY entry {position} must not include userinfo"
+        )
+    if not parsed.hostname:
+        raise RelayConfigError(
+            f"HERMES_IROH_RELAY entry {position} has no hostname"
+        )
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise RelayConfigError(
+            f"HERMES_IROH_RELAY entry {position} has an invalid port"
+        ) from exc
 
 
 def parse_relay_setting(value: Optional[str]) -> RelayConfig:
@@ -259,16 +477,12 @@ def parse_relay_setting(value: Optional[str]) -> RelayConfig:
     if raw.lower() in _DISABLED_RELAY_VALUES:
         return RelayConfig(raw, "disabled")
     urls = tuple(part.strip() for part in raw.split(","))
-    if not urls or any(not url for url in urls):
-        raise RelayConfigError(
-            f"HERMES_IROH_RELAY contains an empty relay URL: {raw!r}"
-        )
-    for url in urls:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    for position, url in enumerate(urls, start=1):
+        if not url:
             raise RelayConfigError(
-                f"HERMES_IROH_RELAY contains an invalid relay URL: {url!r}"
+                f"HERMES_IROH_RELAY entry {position} is empty"
             )
+        _validate_relay_url(url, position)
     return RelayConfig(raw, "custom", urls)
 
 
@@ -282,7 +496,8 @@ def build_relay_mode(config: RelayConfig) -> Any:
             return iroh.RelayMode.custom_from_urls(list(config.urls))
         except Exception as exc:
             raise RelayConfigError(
-                f"HERMES_IROH_RELAY could not be applied: {config.value!r}"
+                "HERMES_IROH_RELAY could not be applied "
+                f"({type(exc).__name__})"
             ) from exc
     return iroh.RelayMode.default_mode()
 
@@ -328,6 +543,7 @@ class Allowlist:
         self._lock = asyncio.Lock()
         self._file_entries: frozenset[str] = frozenset()
         self._file_stamp: Optional[tuple[int, int]] = None
+        self._file_unsafe: Optional[str] = None
         self._loaded = False
 
     def _read_env(self) -> str:
@@ -335,29 +551,74 @@ class Allowlist:
 
     def _file_stamp_now(self) -> Optional[tuple[int, int]]:
         try:
-            stat = self.path.stat()
+            info = os.lstat(self.path)
         except OSError:
             return None
-        return (stat.st_mtime_ns, stat.st_size)
+        return (info.st_mtime_ns, info.st_size)
+
+    @staticmethod
+    def _valid_entry(entry: Any) -> Optional[str]:
+        if not isinstance(entry, str):
+            return None
+        value = normalize_node_id(entry)
+        return value if _NODE_ID_RE.match(value) else None
+
+    def _audit_reload(
+        self, previous: frozenset[str], current: frozenset[str]
+    ) -> None:
+        added = sorted(current - previous)
+        removed = sorted(previous - current)
+        if not added and not removed:
+            return
+        logger.info(
+            "iroh audit: allowlist reload added=%s removed=%s entries=%d",
+            ",".join(added) or "-",
+            ",".join(removed) or "-",
+            len(current),
+        )
 
     def _reload_if_changed(self) -> None:
         stamp = self._file_stamp_now()
         if self._loaded and stamp == self._file_stamp:
             return
+        previous = self._file_entries
+        was_loaded = self._loaded
         self._loaded = True
         self._file_stamp = stamp
+        self._file_unsafe = None
         if stamp is None:
             self._file_entries = frozenset()
+            if was_loaded:
+                self._audit_reload(previous, self._file_entries)
             return
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+            raw = _read_safe_bytes(
+                self.path,
+                max_bytes=ALLOWLIST_MAX_BYTES,
+                require_owner_only=False,
+            )
+        except FileSafetyError as exc:
+            self._file_unsafe = str(exc)
+            logger.warning(
+                "iroh allowlist file %s is unusable (%s); no file entries active",
+                self.path,
+                exc,
+            )
+            self._file_entries = frozenset()
+            if was_loaded:
+                self._audit_reload(previous, self._file_entries)
+            return
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
             logger.warning(
                 "iroh allowlist file %s is unusable (%s); no file entries active",
                 self.path,
                 type(exc).__name__,
             )
             self._file_entries = frozenset()
+            if was_loaded:
+                self._audit_reload(previous, self._file_entries)
             return
         entries = payload.get("allowed_node_ids") if isinstance(payload, dict) else None
         if not isinstance(entries, list):
@@ -367,19 +628,35 @@ class Allowlist:
                 self.path,
             )
             self._file_entries = frozenset()
+            if was_loaded:
+                self._audit_reload(previous, self._file_entries)
             return
-        normalized = {
-            normalize_node_id(entry)
-            for entry in entries
-            if isinstance(entry, str) and normalize_node_id(entry)
-        }
+        normalized: set[str] = set()
+        invalid = 0
+        for entry in entries:
+            value = self._valid_entry(entry)
+            if value is None:
+                invalid += 1
+            else:
+                normalized.add(value)
+        if invalid:
+            logger.warning(
+                "iroh allowlist file %s has %d invalid entries; "
+                "they authorize no client",
+                self.path,
+                invalid,
+            )
         self._file_entries = frozenset(normalized)
+        if was_loaded:
+            self._audit_reload(previous, self._file_entries)
 
     def _env_entries(self) -> frozenset[str]:
         raw = self._env_reader() or ""
         parts = re.split(r"[,\s]+", raw.strip())
         return frozenset(
-            normalize_node_id(part) for part in parts if part.strip()
+            value
+            for value in (self._valid_entry(part) for part in parts if part.strip())
+            if value is not None
         )
 
     def entries(self) -> frozenset[str]:
@@ -389,16 +666,52 @@ class Allowlist:
     def check(self, node_id: str) -> bool:
         return normalize_node_id(node_id) in self.entries()
 
+    def _refuse_unsafe_write(self) -> None:
+        if self._file_unsafe is None:
+            return
+        raise PermissionError(
+            f"allowlist file {self.path} {self._file_unsafe}; fix the file "
+            "permissions or set HERMES_IROH_STATE_DIR to a private directory"
+        )
+
     async def add(self, node_id: str) -> str:
         normalized = self._validate(node_id)
         async with self._lock:
             self._reload_if_changed()
+            self._refuse_unsafe_write()
             current = set(self._file_entries)
             current.add(normalized)
             self._write_atomic(sorted(current))
             self._file_entries = frozenset(current)
             self._file_stamp = self._file_stamp_now()
+            self._file_unsafe = None
             self._loaded = True
+            logger.info(
+                "iroh audit: allowlist added node_id=%s entries=%d",
+                normalized,
+                len(current),
+            )
+        return normalized
+
+    async def remove(self, node_id: str) -> str:
+        normalized = self._validate(node_id)
+        async with self._lock:
+            self._reload_if_changed()
+            self._refuse_unsafe_write()
+            current = set(self._file_entries)
+            if normalized not in current:
+                return normalized
+            current.discard(normalized)
+            self._write_atomic(sorted(current))
+            self._file_entries = frozenset(current)
+            self._file_stamp = self._file_stamp_now()
+            self._file_unsafe = None
+            self._loaded = True
+            logger.info(
+                "iroh audit: allowlist removed node_id=%s entries=%d",
+                normalized,
+                len(current),
+            )
         return normalized
 
     def _write_atomic(self, entries: Iterable[str]) -> None:
@@ -468,7 +781,13 @@ def parse_prompt(raw: bytes) -> Prompt:
         session_id = DEFAULT_SESSION_ID
     if not isinstance(session_id, str):
         raise PromptError(ERR_INVALID_PROMPT, "session_id must be a string")
-    session_id = session_id.strip() or DEFAULT_SESSION_ID
+    if not session_id.strip():
+        session_id = DEFAULT_SESSION_ID
+    elif not _SESSION_ID_RE.fullmatch(session_id):
+        raise PromptError(
+            ERR_INVALID_PROMPT,
+            "session_id must match ^(?!.*\\.\\.)[A-Za-z0-9_.-]{1,128}$",
+        )
     return Prompt(session_id=session_id, text=body)
 
 
@@ -512,20 +831,19 @@ def chunk_text(text: str, limit: int = MAX_DELTA_BYTES) -> list[str]:
     if len(encoded) <= limit:
         return [text] if text else []
     chunks: list[str] = []
-    remaining = encoded
-    while remaining:
-        if len(remaining) <= limit:
-            chunks.append(remaining.decode("utf-8"))
-            break
-        cut = limit
-        while cut > 0 and (remaining[cut] & 0xC0) == 0x80:
-            cut -= 1
-        if cut == 0:
-            cut = max(limit, 1)
-            while cut < len(remaining) and (remaining[cut] & 0xC0) == 0x80:
-                cut += 1
-        chunks.append(remaining[:cut].decode("utf-8"))
-        remaining = remaining[cut:]
+    size = len(encoded)
+    start = 0
+    while start < size:
+        end = min(start + limit, size)
+        if end < size:
+            while end > start and (encoded[end] & 0xC0) == 0x80:
+                end -= 1
+            if end == start:
+                end = start + limit
+                while end < size and (encoded[end] & 0xC0) == 0x80:
+                    end += 1
+        chunks.append(encoded[start:end].decode("utf-8"))
+        start = end
     return chunks
 
 
@@ -544,12 +862,16 @@ class StreamSession:
         session_id: str,
         chat_id: str,
         max_delta_bytes: int = MAX_DELTA_BYTES,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
+        if max_response_bytes <= 0:
+            raise ValueError("max_response_bytes must be positive")
         self._send = send
         self.node_id = node_id
         self.session_id = session_id
         self.chat_id = chat_id
         self.max_delta_bytes = max_delta_bytes
+        self.max_response_bytes = max_response_bytes
         self.finished = asyncio.Event()
         self.started = False
         self.terminal = False
@@ -573,9 +895,22 @@ class StreamSession:
         for chunk in chunk_text(text, self.max_delta_bytes):
             if not self._can_write():
                 return
+            size = len(chunk.encode("utf-8"))
+            if self.bytes_sent + size > self.max_response_bytes:
+                logger.info(
+                    "iroh audit: prompt rejected reason=%s node_id=%s "
+                    "session_id=%s bytes=%d limit=%d",
+                    ERR_RESPONSE_TOO_LARGE,
+                    self.node_id,
+                    self.session_id,
+                    self.bytes_sent + size,
+                    self.max_response_bytes,
+                )
+                await self.fail(ERR_RESPONSE_TOO_LARGE)
+                return
             await self._write(delta_frame(chunk))
             self.deltas_sent += 1
-            self.bytes_sent += len(chunk.encode("utf-8"))
+            self.bytes_sent += size
 
     async def finish(self) -> None:
         if not self._can_write():
@@ -637,6 +972,7 @@ class ChannelServer:
         prompt_handler: Optional[
             Callable[[StreamSession, str], Awaitable[None]]
         ] = None,
+        on_session_end: Optional[Callable[[StreamSession], None]] = None,
         bind_addr: Optional[str] = None,
         preset: Any = None,
         turn_timeout: float = DEFAULT_TURN_TIMEOUT,
@@ -645,11 +981,24 @@ class ChannelServer:
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         max_streams_per_connection: int = DEFAULT_MAX_STREAMS_PER_CONNECTION,
         max_total_streams: int = DEFAULT_MAX_TOTAL_STREAMS,
+        max_pending_handshakes: int = DEFAULT_MAX_PENDING_HANDSHAKES,
+        max_streams_per_node: int = DEFAULT_MAX_STREAMS_PER_NODE,
+        max_prompts_per_minute: int = DEFAULT_MAX_PROMPTS_PER_MINUTE,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
+        for name, value in (
+            ("max_pending_handshakes", max_pending_handshakes),
+            ("max_streams_per_node", max_streams_per_node),
+            ("max_prompts_per_minute", max_prompts_per_minute),
+            ("max_response_bytes", max_response_bytes),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
         self.key_store = key_store if key_store is not None else NodeKeyStore()
         self.allowlist = allowlist if allowlist is not None else Allowlist()
         self.relay = relay
         self.prompt_handler = prompt_handler
+        self.on_session_end = on_session_end
         self.bind_addr = bind_addr
         self.preset = preset
         self.turn_timeout = turn_timeout
@@ -658,18 +1007,28 @@ class ChannelServer:
         self.max_connections = max_connections
         self.max_streams_per_connection = max_streams_per_connection
         self.max_total_streams = max_total_streams
+        self.max_pending_handshakes = max_pending_handshakes
+        self.max_streams_per_node = max_streams_per_node
+        self.max_prompts_per_minute = max_prompts_per_minute
+        self.max_response_bytes = max_response_bytes
 
         self.node_id: Optional[str] = None
         self._ticket: Optional[str] = None
         self._endpoint: Any = None
         self._accept_task: Optional[asyncio.Task] = None
-        self._stop_lock: Optional[asyncio.Lock] = None
+        self._lifecycle_lock: Optional[asyncio.Lock] = None
         self._connections: set[Any] = set()
         self._connection_tasks: set[asyncio.Task] = set()
         self._stream_tasks: set[asyncio.Task] = set()
         self._sessions: dict[str, StreamSession] = {}
         self._active_connections = 0
         self._active_streams = 0
+        self._node_streams: dict[str, int] = {}
+        self._node_prompt_times: dict[str, deque[float]] = {}
+        self._handshake_semaphore: Optional[asyncio.Semaphore] = None
+        self.rejection_count = 0
+        self._last_rejection_log = 0.0
+        self._suppressed_rejections = 0
         self.rejections: deque[str] = deque(maxlen=MAX_RECORDED_REJECTIONS)
         self._rejection_event = asyncio.Event()
 
@@ -702,48 +1061,117 @@ class ChannelServer:
             self.rejections.append(remote_id)
         self._rejection_event.set()
 
+    def _log_rejection(self, reason: str, *, node_id: Optional[str] = None) -> None:
+        self.rejection_count += 1
+        now = time.monotonic()
+        if (
+            self._last_rejection_log
+            and now - self._last_rejection_log < REJECTION_LOG_INTERVAL
+        ):
+            self._suppressed_rejections += 1
+            return
+        suppressed, self._suppressed_rejections = (
+            self._suppressed_rejections,
+            0,
+        )
+        self._last_rejection_log = now
+        logger.info(
+            "iroh audit: rejected reason=%s node_id=%s suppressed=%d",
+            reason,
+            node_id or "-",
+            suppressed,
+        )
+
+    @staticmethod
+    async def _refuse_incoming(incoming: Any) -> None:
+        for name in ("close", "refuse", "abort"):
+            method = getattr(incoming, name, None)
+            if method is None:
+                continue
+            try:
+                result = method()
+                if inspect.isawaitable(result):
+                    await result
+                return
+            except Exception as exc:
+                logger.debug(
+                    "iroh incoming %s failed: %s", name, type(exc).__name__
+                )
+
+    @staticmethod
+    async def _close_endpoint_quietly(endpoint: Any) -> None:
+        try:
+            await endpoint.close()
+        except Exception as exc:
+            logger.debug("iroh endpoint close failed: %s", type(exc).__name__)
+
     async def start(self) -> None:
         import iroh
 
-        if self._endpoint is not None:
-            return
-        iroh.iroh_ffi.uniffi_set_event_loop(asyncio.get_running_loop())
-        secret = self.key_store.load_or_create()
-        relay_config = self.relay
-        if relay_config is None:
-            relay_config = parse_relay_setting(
-                os.environ.get("HERMES_IROH_RELAY")
+        if self._lifecycle_lock is None:
+            self._lifecycle_lock = asyncio.Lock()
+        async with self._lifecycle_lock:
+            if self._endpoint is not None:
+                return
+            self._handshake_semaphore = asyncio.Semaphore(
+                self.max_pending_handshakes
             )
-        relay_mode = build_relay_mode(relay_config)
-        self.relay = relay_config
-        options: dict[str, Any] = {
-            "preset": self.preset if self.preset is not None else iroh.preset_n0(),
-            "secret_key": secret.to_bytes(),
-            "alpns": [ALPN],
-            "relay_mode": relay_mode,
-        }
-        if self.bind_addr:
-            options["bind_addr"] = self.bind_addr
-        try:
-            endpoint = await iroh.Endpoint.bind(iroh.EndpointOptions(**options))
-        except Exception as exc:
-            raise TransportError(
-                f"could not bind the Iroh endpoint ({type(exc).__name__})"
-            ) from exc
-        self._endpoint = endpoint
-        self.node_id = str(endpoint.id())
-        self._ticket = str(iroh.EndpointTicket.from_addr(endpoint.addr()))
-        self._accept_task = asyncio.create_task(self._accept_loop())
-        logger.info(
-            "iroh channel listening: node_id=%s relay=%s",
-            self.node_id,
-            relay_config.describe(),
-        )
+            self._node_streams.clear()
+            self._node_prompt_times.clear()
+            self.rejection_count = 0
+            self._suppressed_rejections = 0
+            self._last_rejection_log = 0.0
+            iroh.iroh_ffi.uniffi_set_event_loop(asyncio.get_running_loop())
+            secret = self.key_store.load_or_create()
+            relay_config = self.relay
+            if relay_config is None:
+                relay_config = parse_relay_setting(
+                    os.environ.get("HERMES_IROH_RELAY")
+                )
+            relay_mode = build_relay_mode(relay_config)
+            self.relay = relay_config
+            options: dict[str, Any] = {
+                "preset": self.preset if self.preset is not None else iroh.preset_n0(),
+                "secret_key": secret.to_bytes(),
+                "alpns": [ALPN],
+                "relay_mode": relay_mode,
+            }
+            if self.bind_addr:
+                options["bind_addr"] = self.bind_addr
+            try:
+                endpoint = await iroh.Endpoint.bind(
+                    iroh.EndpointOptions(**options)
+                )
+            except Exception as exc:
+                raise TransportError(
+                    f"could not bind the Iroh endpoint ({type(exc).__name__})"
+                ) from exc
+            try:
+                node_id = str(endpoint.id())
+                ticket = str(iroh.EndpointTicket.from_addr(endpoint.addr()))
+                accept_task = asyncio.create_task(self._accept_loop())
+            except asyncio.CancelledError:
+                await self._close_endpoint_quietly(endpoint)
+                raise
+            except BaseException as exc:
+                await self._close_endpoint_quietly(endpoint)
+                raise TransportError(
+                    f"could not start the Iroh endpoint ({type(exc).__name__})"
+                ) from exc
+            self._endpoint = endpoint
+            self.node_id = node_id
+            self._ticket = ticket
+            self._accept_task = accept_task
+            logger.info(
+                "iroh channel listening: node_id=%s relay=%s",
+                self.node_id,
+                relay_config.describe(),
+            )
 
     async def stop(self) -> None:
-        if self._stop_lock is None:
-            self._stop_lock = asyncio.Lock()
-        async with self._stop_lock:
+        if self._lifecycle_lock is None:
+            self._lifecycle_lock = asyncio.Lock()
+        async with self._lifecycle_lock:
             task, self._accept_task = self._accept_task, None
             if task is not None:
                 task.cancel()
@@ -762,12 +1190,7 @@ class ChannelServer:
             self._connections.clear()
             endpoint, self._endpoint = self._endpoint, None
             if endpoint is not None:
-                try:
-                    await endpoint.close()
-                except Exception as exc:
-                    logger.debug(
-                        "iroh endpoint close failed: %s", type(exc).__name__
-                    )
+                await self._close_endpoint_quietly(endpoint)
             self._ticket = None
             pending = [t for t in self._connection_tasks if not t.done()]
             pending.extend(t for t in self._stream_tasks if not t.done())
@@ -779,54 +1202,61 @@ class ChannelServer:
             self._stream_tasks.clear()
             self._active_connections = 0
             self._active_streams = 0
+            self._node_streams.clear()
+            self._node_prompt_times.clear()
+            self._handshake_semaphore = None
 
     async def _accept_loop(self) -> None:
+        backoff = ACCEPT_BACKOFF_MIN
         while self._endpoint is not None:
             try:
                 incoming = await self._endpoint.accept_next()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug("iroh accept_next failed: %s", type(exc).__name__)
-                return
+                if self._endpoint is None:
+                    return
+                logger.debug(
+                    "iroh accept_next failed: %s", type(exc).__name__
+                )
+                self._log_rejection("accept_failed")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, ACCEPT_BACKOFF_MAX)
+                continue
+            backoff = ACCEPT_BACKOFF_MIN
             if incoming is None:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(ACCEPT_BACKOFF_MIN)
+                continue
+            if not await self._acquire_handshake_slot(incoming):
                 continue
             task = asyncio.create_task(self._handle_incoming(incoming))
             self._connection_tasks.add(task)
             task.add_done_callback(self._connection_tasks.discard)
 
+    async def _acquire_handshake_slot(self, incoming: Any) -> bool:
+        semaphore = self._handshake_semaphore
+        if semaphore is not None and semaphore.locked():
+            self._log_rejection("admission_limit")
+            await self._refuse_incoming(incoming)
+            return False
+        if semaphore is not None:
+            await semaphore.acquire()
+        return True
+
     async def _handle_incoming(self, incoming: Any) -> None:
         try:
-            accepting = await incoming.accept()
+            connection, remote_id = await self._handshake(incoming)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.debug("iroh incoming accept failed: %s", type(exc).__name__)
+            logger.debug("iroh handshake failed: %s", type(exc).__name__)
             return
-        try:
-            connection = await accepting.connect()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.debug("iroh connect failed: %s", type(exc).__name__)
+        finally:
+            semaphore = self._handshake_semaphore
+            if semaphore is not None:
+                semaphore.release()
+        if connection is None:
             return
-        alpn = connection.alpn()
-        if alpn != ALPN:
-            self._close_connection(connection, 1, b"invalid alpn")
-            return
-        remote_id = str(connection.remote_id())
-        if not self.allowlist.check(remote_id):
-            self._record_rejection(remote_id)
-            logger.warning("iroh connection rejected: node is not allowlisted")
-            self._close_connection(connection, 2, b"unauthorized")
-            return
-        if self._active_connections >= self.max_connections:
-            logger.warning("iroh connection rejected: connection limit reached")
-            self._close_connection(connection, 3, b"connection limit")
-            return
-        self._active_connections += 1
-        self._connections.add(connection)
         try:
             await self._serve_connection(connection, remote_id)
         except asyncio.CancelledError:
@@ -838,6 +1268,40 @@ class ChannelServer:
         finally:
             self._active_connections -= 1
             self._connections.discard(connection)
+
+    async def _handshake(self, incoming: Any) -> tuple[Any, Optional[str]]:
+        try:
+            accepting = await incoming.accept()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("iroh incoming accept failed: %s", type(exc).__name__)
+            return None, None
+        try:
+            connection = await accepting.connect()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("iroh connect failed: %s", type(exc).__name__)
+            return None, None
+        remote_id = str(connection.remote_id())
+        alpn = connection.alpn()
+        if alpn != ALPN:
+            self._log_rejection("invalid_alpn", node_id=remote_id)
+            self._close_connection(connection, 1, b"invalid alpn")
+            return None, None
+        if not self.allowlist.check(remote_id):
+            self._record_rejection(remote_id)
+            self._log_rejection("unauthorized", node_id=remote_id)
+            self._close_connection(connection, 2, b"unauthorized")
+            return None, None
+        if self._active_connections >= self.max_connections:
+            self._log_rejection("connection_limit", node_id=remote_id)
+            self._close_connection(connection, 3, b"connection limit")
+            return None, None
+        self._active_connections += 1
+        self._connections.add(connection)
+        return connection, remote_id
 
     @staticmethod
     def _close_connection(connection: Any, code: int, reason: bytes) -> None:
@@ -857,14 +1321,21 @@ class ChannelServer:
                 return
             if self._endpoint is None:
                 return
+            node_streams = self._node_streams.get(remote_id, 0)
             if (
                 self._active_streams >= self.max_total_streams
                 or stream_semaphore.locked()
+                or node_streams >= self.max_streams_per_node
             ):
+                if node_streams >= self.max_streams_per_node:
+                    self._log_rejection(
+                        ERR_TOO_MANY_STREAMS, node_id=remote_id
+                    )
                 await self._reject_stream(bi_stream)
                 continue
             await stream_semaphore.acquire()
             self._active_streams += 1
+            self._node_streams[remote_id] = node_streams + 1
             task = asyncio.create_task(
                 self._serve_stream_task(
                     bi_stream, remote_id, stream_semaphore
@@ -874,12 +1345,7 @@ class ChannelServer:
             task.add_done_callback(self._stream_tasks.discard)
 
     async def _reject_stream(self, bi_stream: Any) -> None:
-        send = bi_stream.send()
-        try:
-            await send.write_all(encode_frame(error_frame(ERR_TOO_MANY_STREAMS)))
-            await send.finish()
-        except Exception:
-            pass
+        await self._send_error(bi_stream.send(), ERR_TOO_MANY_STREAMS)
 
     async def _serve_stream_task(
         self,
@@ -895,11 +1361,37 @@ class ChannelServer:
             logger.debug("iroh stream failed: %s", type(exc).__name__)
         finally:
             self._active_streams -= 1
+            remaining = self._node_streams.get(remote_id, 0) - 1
+            if remaining > 0:
+                self._node_streams[remote_id] = remaining
+            else:
+                self._node_streams.pop(remote_id, None)
             semaphore.release()
 
+    def _authorize_stream(self, remote_id: str) -> bool:
+        if self.allowlist.check(remote_id):
+            return True
+        self._record_rejection(remote_id)
+        self._log_rejection(ERR_UNAUTHORIZED, node_id=remote_id)
+        return False
+
+    def _record_prompt_attempt(self, remote_id: str) -> bool:
+        now = time.monotonic()
+        window = self._node_prompt_times.setdefault(remote_id, deque())
+        while window and now - window[0] >= PROMPT_RATE_WINDOW:
+            window.popleft()
+        window.append(now)
+        if len(window) > self.max_prompts_per_minute:
+            self._log_rejection(ERR_RATE_LIMITED, node_id=remote_id)
+            return False
+        return True
+
     async def _serve_stream(self, bi_stream: Any, remote_id: str) -> None:
-        recv = bi_stream.recv()
         send = bi_stream.send()
+        if not self._authorize_stream(remote_id):
+            await self._send_error(send, ERR_UNAUTHORIZED)
+            return
+        recv = bi_stream.recv()
         try:
             raw = await read_prompt_line(
                 recv,
@@ -914,6 +1406,12 @@ class ChannelServer:
         except PromptError as exc:
             await self._send_error(send, exc.code)
             return
+        if not self._authorize_stream(remote_id):
+            await self._send_error(send, ERR_UNAUTHORIZED)
+            return
+        if not self._record_prompt_attempt(remote_id):
+            await self._send_error(send, ERR_RATE_LIMITED)
+            return
         chat_id = make_chat_id(remote_id, prompt.session_id)
         existing = self._sessions.get(chat_id)
         if existing is not None and not existing.terminal:
@@ -924,6 +1422,7 @@ class ChannelServer:
             node_id=remote_id,
             session_id=prompt.session_id,
             chat_id=chat_id,
+            max_response_bytes=self.max_response_bytes,
         )
         session.slash_prompt = prompt.text.lstrip().startswith("/")
         self._sessions[chat_id] = session
@@ -955,6 +1454,14 @@ class ChannelServer:
                 self._sessions.pop(chat_id, None)
             if not session.terminal:
                 session.cancel()
+            if self.on_session_end is not None:
+                try:
+                    self.on_session_end(session)
+                except Exception as exc:
+                    logger.debug(
+                        "iroh session-end cleanup failed: %s",
+                        type(exc).__name__,
+                    )
 
     @staticmethod
     async def _watch_send_stopped(send: Any) -> None:

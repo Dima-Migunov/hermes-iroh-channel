@@ -217,6 +217,12 @@ def make_adapter(tmp_path):
     return adapter_class(None), service
 
 
+def allow_node_allowlist(tmp_path) -> transport.Allowlist:
+    return transport.Allowlist(
+        path=tmp_path / "allowlist.json", env_reader=lambda: NODE_A
+    )
+
+
 def make_session(tmp_path, node_id: str = NODE_A, session_id: str = "default"):
     send = FakeSend()
     session = transport.StreamSession(
@@ -311,16 +317,17 @@ async def test_connect_failure_logs_class_and_next_action(
     assert "allowlist" not in message.lower()
 
 
-async def test_connect_failure_log_names_invalid_relay_value(
+async def test_connect_failure_log_names_invalid_relay_entry_without_the_value(
     tmp_path, monkeypatch, caplog
 ):
     adapter, service = make_adapter(tmp_path)
     bad_value = "ftp://relay.example.com"
 
     async def failing_start():
-        raise transport.RelayConfigError(
-            f"unsupported relay URL scheme: {bad_value!r}"
-        )
+        try:
+            transport.parse_relay_setting(bad_value)
+        except transport.RelayConfigError as exc:
+            raise exc from None
 
     monkeypatch.setattr(service, "start", failing_start)
 
@@ -328,7 +335,8 @@ async def test_connect_failure_log_names_invalid_relay_value(
         assert await adapter.connect() is False
 
     assert "RelayConfigError" in caplog.text
-    assert bad_value in caplog.text
+    assert "entry 1 must use the http or https scheme" in caplog.text
+    assert bad_value not in caplog.text
 
 
 async def test_disconnect_is_idempotent(tmp_path, monkeypatch):
@@ -419,7 +427,7 @@ async def test_turn_timeout_produces_error_frame(tmp_path):
     session.chat_id = transport.make_chat_id(NODE_A, "default")
     server = transport.ChannelServer(
         key_store=service.key_store,
-        allowlist=service.allowlist,
+        allowlist=allow_node_allowlist(tmp_path),
         turn_timeout=0.05,
         prompt_handler=gateway_adapter.build_prompt_handler(
             service, adapter, FakeEvent
@@ -451,6 +459,122 @@ async def test_turn_timeout_produces_error_frame(tmp_path):
     assert server._sessions == {}
 
 
+async def test_session_end_callback_runs_once_after_timeout(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    ended: list[transport.StreamSession] = []
+
+    async def hang(event):
+        await asyncio.Event().wait()
+
+    adapter.handle_message = hang
+    server = transport.ChannelServer(
+        key_store=service.key_store,
+        allowlist=allow_node_allowlist(tmp_path),
+        turn_timeout=0.05,
+        prompt_handler=gateway_adapter.build_prompt_handler(
+            service, adapter, FakeEvent
+        ),
+        on_session_end=ended.append,
+    )
+
+    class FakeRecv:
+        async def read(self, size_limit):
+            return b'{"type":"prompt","session_id":"default","text":"hi"}\n'
+
+    class FakeBi:
+        def __init__(self, send_stream):
+            self._send = send_stream
+
+        def recv(self):
+            return FakeRecv()
+
+        def send(self):
+            return self._send
+
+    send = FakeSend()
+    await server._serve_stream(FakeBi(send), NODE_A)
+
+    assert send.frames()[-1] == {
+        "type": "error",
+        "message": transport.ERR_TIMEOUT,
+    }
+    assert len(ended) == 1
+    assert ended[0].chat_id == transport.make_chat_id(NODE_A, "default")
+    assert ended[0].node_id == NODE_A
+    assert server._sessions == {}
+
+
+async def test_turn_timeout_releases_router_state(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+    service.allowlist = allow_node_allowlist(tmp_path)
+    adapter_class = gateway_adapter.build_adapter_class(
+        service, FakeAdapterBase, "iroh", FakeSendResult, FakeEvent
+    )
+    adapter = adapter_class(None)
+    chat_id = transport.make_chat_id(NODE_A, "default")
+    invoked = asyncio.Event()
+
+    async def partial_then_hang(event):
+        service.router.consume(chat_id, "partial answer")
+        invoked.set()
+        await asyncio.Event().wait()
+
+    adapter.handle_message = partial_then_hang
+
+    async def fake_start(server_self):
+        server_self._endpoint = object()
+
+    monkeypatch.setattr(transport.ChannelServer, "start", fake_start)
+    server = await service.start()
+    server.set_prompt_handler(
+        gateway_adapter.build_prompt_handler(service, adapter, FakeEvent)
+    )
+    server.turn_timeout = 0.05
+
+    class FakeRecv:
+        async def read(self, size_limit):
+            return b'{"type":"prompt","session_id":"default","text":"hi"}\n'
+
+    class FakeBi:
+        def __init__(self, send_stream):
+            self._send = send_stream
+
+        def recv(self):
+            return FakeRecv()
+
+        def send(self):
+            return self._send
+
+    send = FakeSend()
+    await server._serve_stream(FakeBi(send), NODE_A)
+
+    assert invoked.is_set()
+    assert service.router._last == {}
+    assert server._sessions == {}
+
+
+async def test_newer_session_keeps_router_state(tmp_path):
+    service = make_service(tmp_path)
+    ending_session, _ending_send = make_session(tmp_path)
+    newer_session, _newer_send = make_session(tmp_path)
+    assert ending_session.chat_id == newer_session.chat_id
+
+    class StubServer:
+        def session_for(self, chat_id):
+            if chat_id == newer_session.chat_id:
+                return newer_session
+            return None
+
+    service.server = StubServer()
+    service.router.consume(ending_session.chat_id, "newer turn text")
+
+    service._release_session_state(ending_session)
+
+    assert service.router._last == {
+        ending_session.chat_id: "newer turn text"
+    }
+
+
 async def test_response_is_delivered_after_handler_returns(tmp_path):
     adapter, service = make_adapter(tmp_path)
     session_id = "conv-async"
@@ -459,7 +583,7 @@ async def test_response_is_delivered_after_handler_returns(tmp_path):
 
     server = transport.ChannelServer(
         key_store=service.key_store,
-        allowlist=service.allowlist,
+        allowlist=allow_node_allowlist(tmp_path),
         turn_timeout=5.0,
         prompt_handler=gateway_adapter.build_prompt_handler(
             service, adapter, FakeEvent
@@ -505,7 +629,7 @@ async def test_notice_send_does_not_finalize_the_stream(tmp_path):
 
     server = transport.ChannelServer(
         key_store=service.key_store,
-        allowlist=service.allowlist,
+        allowlist=allow_node_allowlist(tmp_path),
         turn_timeout=5.0,
         prompt_handler=gateway_adapter.build_prompt_handler(
             service, adapter, FakeEvent
@@ -557,7 +681,7 @@ async def test_slash_command_reply_finalizes_without_notify(tmp_path):
 
     server = transport.ChannelServer(
         key_store=service.key_store,
-        allowlist=service.allowlist,
+        allowlist=allow_node_allowlist(tmp_path),
         turn_timeout=5.0,
         prompt_handler=gateway_adapter.build_prompt_handler(
             service, adapter, FakeEvent
@@ -862,6 +986,20 @@ async def test_info_reports_relay_from_environment(tmp_path, monkeypatch):
     text = await gateway_adapter.handle_info(service)
 
     assert "relay: https://relay.example.com" in text
+
+
+async def test_info_redacts_relay_userinfo_and_query(tmp_path, monkeypatch):
+    service = make_command_service(tmp_path)
+    monkeypatch.setenv(
+        "HERMES_IROH_RELAY",
+        "https://relay.example.com/path?token=abc",
+    )
+
+    text = await gateway_adapter.handle_info(service)
+
+    assert "relay: https://relay.example.com/path" in text
+    assert "token" not in text
+    assert "?" not in text.split("relay: ", 1)[1].splitlines()[0]
 
 
 async def test_allow_persists_valid_node_id(tmp_path):

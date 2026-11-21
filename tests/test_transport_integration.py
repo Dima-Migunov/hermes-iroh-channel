@@ -600,3 +600,198 @@ async def test_client_stop_reading_releases_session_before_turn_timeout(tmp_path
         release.set()
         await server.stop()
         await client_endpoint.close()
+
+
+async def test_revocation_rejects_the_next_stream_on_an_open_connection(
+    tmp_path,
+):
+    async def handler(session, text):
+        await session.append("ok")
+        await session.finish()
+
+    server, client_endpoint, _server_id, _client_id = await make_endpoints(
+        tmp_path
+    )
+    server.set_prompt_handler(handler)
+    clients = []
+    try:
+        await server.start()
+        addr = _addr(server)
+        connection = await client_endpoint.connect(addr, transport.ALPN)
+        first = Client(client_endpoint, connection, await connection.open_bi())
+        await first.send_prompt("one", session_id="a")
+        assert (await first.read_frames_until_terminal())[-1] == {
+            "type": "done"
+        }
+
+        allowlist_path = tmp_path / "allowlist.json"
+        allowlist_path.write_text(
+            json.dumps({"allowed_node_ids": []}), encoding="utf-8"
+        )
+        allowlist_path.chmod(0o600)
+
+        second = Client(
+            client_endpoint, connection, await connection.open_bi()
+        )
+        await second.send_prompt("two", session_id="b")
+        frames = await second.read_all_frames()
+
+        assert frames == [
+            {"type": "error", "message": transport.ERR_UNAUTHORIZED}
+        ]
+        clients.extend([first, second])
+    finally:
+        for client in clients:
+            await client.close()
+        await server.stop()
+        await client_endpoint.close()
+
+
+async def test_per_node_stream_limit_rejects_a_second_concurrent_prompt(
+    tmp_path,
+):
+    release = asyncio.Event()
+
+    async def handler(session, text):
+        await release.wait()
+        await session.append("ok")
+        await session.finish()
+
+    server, client_endpoint, _server_id, _client_id = await make_endpoints(
+        tmp_path, max_streams_per_node=1
+    )
+    server.set_prompt_handler(handler)
+    clients = []
+    try:
+        await server.start()
+        connection = await client_endpoint.connect(
+            _addr(server), transport.ALPN
+        )
+        first = Client(client_endpoint, connection, await connection.open_bi())
+        await first.send_prompt("one", session_id="a")
+        assert (await first.read_frame())["type"] == "start"
+
+        second = Client(
+            client_endpoint, connection, await connection.open_bi()
+        )
+        await second.send_prompt("two", session_id="b")
+        frames = await second.read_all_frames()
+
+        assert frames == [
+            {"type": "error", "message": transport.ERR_TOO_MANY_STREAMS}
+        ]
+
+        release.set()
+        assert (await first.read_frames_until_terminal())[-1] == {
+            "type": "done"
+        }
+        clients.extend([first, second])
+    finally:
+        release.set()
+        for client in clients:
+            await client.close()
+        await server.stop()
+        await client_endpoint.close()
+
+
+async def test_per_node_prompt_rate_limit_rejects_the_second_prompt(
+    tmp_path,
+):
+    async def handler(session, text):
+        await session.append("ok")
+        await session.finish()
+
+    server, client_endpoint, _server_id, _client_id = await make_endpoints(
+        tmp_path, max_prompts_per_minute=1
+    )
+    server.set_prompt_handler(handler)
+    clients = []
+    try:
+        await server.start()
+        first = await Client.dial(client_endpoint, _addr(server))
+        await first.send_prompt("one", session_id="a")
+        assert (await first.read_frames_until_terminal())[-1] == {
+            "type": "done"
+        }
+
+        second = await Client.dial(client_endpoint, _addr(server))
+        await second.send_prompt("two", session_id="b")
+        frames = await second.read_all_frames()
+
+        assert frames == [
+            {"type": "error", "message": transport.ERR_RATE_LIMITED}
+        ]
+        clients.extend([first, second])
+    finally:
+        for client in clients:
+            await client.close()
+        await server.stop()
+        await client_endpoint.close()
+
+
+async def test_response_size_limit_sends_one_terminal_error(tmp_path):
+    async def handler(session, text):
+        await session.append("x" * 100)
+
+    server, client_endpoint, _server_id, _client_id = await make_endpoints(
+        tmp_path, max_response_bytes=10
+    )
+    server.set_prompt_handler(handler)
+    client = None
+    try:
+        await server.start()
+        client = await Client.dial(client_endpoint, _addr(server))
+        await client.send_prompt("hi", session_id="big")
+        frames = await client.read_frames_until_terminal()
+
+        assert frames[0]["type"] == "start"
+        assert frames[-1] == {
+            "type": "error",
+            "message": transport.ERR_RESPONSE_TOO_LARGE,
+        }
+        assert not any(frame["type"] == "done" for frame in frames)
+    finally:
+        if client is not None:
+            await client.close()
+        await server.stop()
+        await client_endpoint.close()
+
+
+async def test_a_small_admission_cap_keeps_the_endpoint_healthy(tmp_path):
+    async def handler(session, text):
+        await session.append("ok")
+        await session.finish()
+
+    server, client_endpoint, _server_id, _client_id = await make_endpoints(
+        tmp_path, max_pending_handshakes=1
+    )
+    server.set_prompt_handler(handler)
+
+    async def one_dial() -> bool:
+        try:
+            client = await Client.dial(client_endpoint, _addr(server))
+            try:
+                await client.send_prompt("hi", session_id="s")
+                frames = await client.read_frames_until_terminal()
+                return frames[-1] == {"type": "done"}
+            finally:
+                await client.close()
+        except Exception:
+            return False
+
+    try:
+        await server.start()
+        await asyncio.gather(
+            *(one_dial() for _ in range(5)), return_exceptions=False
+        )
+        assert server.running is True
+
+        client = await Client.dial(client_endpoint, _addr(server))
+        await client.send_prompt("after", session_id="after")
+        assert (await client.read_frames_until_terminal())[-1] == {
+            "type": "done"
+        }
+        await client.close()
+    finally:
+        await server.stop()
+        await client_endpoint.close()

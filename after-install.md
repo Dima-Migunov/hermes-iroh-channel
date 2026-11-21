@@ -93,6 +93,35 @@ without a restart. For scripted setups, set the id up front instead:
 hermes config set HERMES_IROH_ALLOWLIST "<64-hex-node-id>"
 ```
 
+### Client protocol notes
+
+- `session_id` is optional and defaults to `default`. A non-blank value must
+  match `^(?!.*\.\.)[A-Za-z0-9_.-]{1,128}$`; spaces, `/`, `..`, control
+  characters, Unicode, and values longer than 128 characters are rejected with
+  `invalid_prompt`.
+- Per-client defaults: 2 concurrent prompts, 30 prompts per 60-second window, and
+  a 4 MiB response cap per turn. Exceeding them yields `too_many_streams`,
+  `rate_limited`, or `response_too_large`. Tune them with
+  `HERMES_IROH_MAX_STREAMS_PER_NODE`, `HERMES_IROH_MAX_PROMPTS_PER_MINUTE`, and
+  `HERMES_IROH_MAX_RESPONSE_BYTES`.
+- Removing a node id from the allowlist takes effect for that node's next stream;
+  an in-flight turn may finish.
+
+### File permissions
+
+The node key must be a regular `0600` file owned by the current user, and the
+state directory must not be group- or world-writable. If startup reports a key
+mode or state-directory error, fix it or move state:
+
+```bash
+chmod 600 node.key
+chmod 700 <state directory>
+hermes config set HERMES_IROH_STATE_DIR "$HOME/.hermes/iroh-channel"
+```
+
+Move `node.key` and `allowlist.json` into the new directory before restarting.
+Ownership and modes are checked; a symlinked key or allowlist is refused.
+
 ### Dependency check
 
 The plugin loads without the Python SDK, but the platform stays unavailable and
@@ -138,4 +167,9 @@ instead of silently changing the identity.
 | `hint:` says the SDK is not importable | The `iroh` package is missing: `hermes plugins enable iroh-channel`, accept the dependency prompt, and restart |
 | Client connects, then is immediately closed | Its node id is not allowlisted: run `/iroh_allow <node_id>` and reconnect |
 | Clients on another network cannot connect | Relaying is disabled (`HERMES_IROH_RELAY=disabled`) and no direct address is reachable |
-| `relay: invalid configuration` | `HERMES_IROH_RELAY` needs `disabled`/`off`/`none` or absolute http(s) URLs |
+| `relay: invalid configuration` | `HERMES_IROH_RELAY` needs `disabled`/`off`/`none` or absolute http(s) URLs with a host and no userinfo |
+| Startup fails naming the key mode | Run `chmod 600 node.key` and restart; the key is never modified automatically |
+| Startup fails naming the state directory | `chmod 700` it or point `HERMES_IROH_STATE_DIR` at a private directory |
+| Client gets `invalid_prompt` on a valid-looking prompt | `session_id` must match `^(?!.*\.\.)[A-Za-z0-9_.-]{1,128}$` |
+| Client gets `rate_limited` | The per-node prompt rate was exceeded; wait for the 60-second window or raise `HERMES_IROH_MAX_PROMPTS_PER_MINUTE` |
+| Client gets `response_too_large` | The reply exceeded the per-turn cap; raise `HERMES_IROH_MAX_RESPONSE_BYTES` |

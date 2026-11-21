@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -173,3 +176,62 @@ def test_parse_repo_slug(remote, expected):
 def test_parse_repo_slug_rejects_other_hosts():
     with pytest.raises(release.ReleaseError):
         release.parse_repo_slug("git@gitlab.com:owner/repo.git")
+
+
+class _RedirectHandler(BaseHTTPRequestHandler):
+    target_hits: list[dict] = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        if self.path.endswith("/releases"):
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                f"http://127.0.0.1:{self.server.server_port}/target",
+            )
+            self.end_headers()
+            return
+        self._record_and_reply()
+
+    def do_GET(self):
+        self._record_and_reply()
+
+    def _record_and_reply(self):
+        type(self).target_hits.append(dict(self.headers))
+        body = json.dumps({"html_url": "http://example.invalid"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def redirect_server():
+    _RedirectHandler.target_hits = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_release_refuses_redirects_without_forwarding_authorization(
+    redirect_server, monkeypatch
+):
+    base = f"http://127.0.0.1:{redirect_server.server_port}"
+    monkeypatch.setattr(release, "GITHUB_API", base)
+
+    with pytest.raises(release.ReleaseError) as excinfo:
+        release.create_release("owner/repo", "v9.9.9", "notes", "secret-token")
+
+    assert "302" in str(excinfo.value)
+    assert _RedirectHandler.target_hits == []

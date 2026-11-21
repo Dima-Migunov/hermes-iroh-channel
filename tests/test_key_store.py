@@ -74,6 +74,7 @@ def test_reload_keeps_node_id_stable(tmp_path):
 def test_existing_key_is_not_regenerated(tmp_path):
     path = tmp_path / "node.key"
     path.write_bytes(b"\x07" * transport.SECRET_KEY_BYTES)
+    path.chmod(0o600)
     backend = FakeBackend()
     store = transport.NodeKeyStore(path=path, backend=backend)
 
@@ -87,6 +88,7 @@ def test_corrupt_key_is_refused_without_overwrite(tmp_path):
     path = tmp_path / "node.key"
     corrupt = b"short"
     path.write_bytes(corrupt)
+    path.chmod(0o600)
     store = transport.NodeKeyStore(path=path, backend=FakeBackend())
 
     with pytest.raises(transport.KeyStoreError) as excinfo:
@@ -108,6 +110,91 @@ def test_unreadable_key_is_refused(tmp_path):
         store.load_or_create()
 
     assert "cannot read" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("mode", [0o640, 0o644])
+def test_key_with_group_permissions_is_refused(tmp_path, mode):
+    path = tmp_path / "node.key"
+    raw = b"\x08" * transport.SECRET_KEY_BYTES
+    path.write_bytes(raw)
+    path.chmod(mode)
+    store = transport.NodeKeyStore(path=path, backend=FakeBackend())
+
+    with pytest.raises(transport.KeyStoreError) as excinfo:
+        store.load_or_create()
+
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "0600" in message
+    assert path.read_bytes() == raw
+    assert stat.S_IMODE(path.stat().st_mode) == mode
+
+
+def test_symlinked_key_is_refused(tmp_path):
+    target = tmp_path / "real.key"
+    raw = b"\x0a" * transport.SECRET_KEY_BYTES
+    target.write_bytes(raw)
+    target.chmod(0o600)
+    link = tmp_path / "node.key"
+    link.symlink_to(target)
+    store = transport.NodeKeyStore(path=link, backend=FakeBackend())
+
+    with pytest.raises(transport.KeyStoreError) as excinfo:
+        store.load_or_create()
+
+    assert "symbolic link" in str(excinfo.value)
+    assert target.read_bytes() == raw
+
+
+def test_key_read_is_byte_bounded(tmp_path):
+    path = tmp_path / "node.key"
+    path.write_bytes(b"\x0b" * (transport.SECRET_KEY_BYTES + 1))
+    path.chmod(0o600)
+    store = transport.NodeKeyStore(path=path, backend=FakeBackend())
+
+    with pytest.raises(transport.KeyStoreError) as excinfo:
+        store.load_or_create()
+
+    assert "expected a 32-byte node key" in str(excinfo.value)
+
+
+def test_group_writable_state_directory_refuses_writes(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    state.chmod(0o775)
+    store = transport.NodeKeyStore(
+        path=state / "node.key", backend=FakeBackend()
+    )
+
+    with pytest.raises(PermissionError) as excinfo:
+        store.load_or_create()
+
+    assert str(state) in str(excinfo.value)
+    assert not (state / "node.key").exists()
+
+
+def test_failed_atomic_write_closes_the_temp_descriptor(tmp_path, monkeypatch):
+    target = tmp_path / "node.key"
+    captured: list[int] = []
+    real_fchmod = os.fchmod
+
+    def failing_fchmod(fd: int, mode: int) -> None:
+        captured.append(fd)
+        real_fchmod(fd, mode)
+        raise OSError("simulated fchmod failure")
+
+    monkeypatch.setattr(os, "fchmod", failing_fchmod)
+
+    with pytest.raises(OSError, match="simulated fchmod failure"):
+        transport._write_file_atomic(
+            target, b"\x01" * transport.SECRET_KEY_BYTES, prefix=".node.key."
+        )
+
+    assert len(captured) == 1
+    with pytest.raises(OSError):
+        os.fstat(captured[0])
+    assert not target.exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_default_paths_follow_state_dir(tmp_path, monkeypatch):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -34,6 +35,16 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "requires_iroh" in item.keywords:
             item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+def _secure_umask():
+    """Create fixtures with owner-only modes, like a hardened install."""
+    previous = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous)
 
 
 @pytest.fixture(autouse=True)

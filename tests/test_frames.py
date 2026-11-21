@@ -44,6 +44,9 @@ def test_error_constants_are_stable():
     assert transport.ERR_TIMEOUT == "timeout"
     assert transport.ERR_UNAUTHORIZED == "unauthorized"
     assert transport.ERR_INTERNAL == "internal_error"
+    assert transport.ERR_TOO_MANY_STREAMS == "too_many_streams"
+    assert transport.ERR_RATE_LIMITED == "rate_limited"
+    assert transport.ERR_RESPONSE_TOO_LARGE == "response_too_large"
     assert transport.ERROR_VALUES == frozenset(
         {
             "invalid_prompt",
@@ -53,6 +56,8 @@ def test_error_constants_are_stable():
             "unauthorized",
             "internal_error",
             "too_many_streams",
+            "rate_limited",
+            "response_too_large",
         }
     )
 
@@ -77,6 +82,58 @@ def test_parse_valid_prompt():
 )
 def test_session_id_defaults(raw):
     assert transport.parse_prompt(raw).session_id == "default"
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    ["conv-1", "a_b.c-d", "A" * 128, "0", ".", "-", "_", "a.b.c"],
+)
+def test_valid_session_ids_are_used(session_id):
+    raw = json.dumps(
+        {"type": "prompt", "text": "hi", "session_id": session_id}
+    ).encode() + b"\n"
+
+    assert transport.parse_prompt(raw).session_id == session_id
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    [
+        "a" * 129,
+        "..",
+        "a..b",
+        "../etc/passwd",
+        "a/b",
+        "a b",
+        "a\tb",
+        "a\nb",
+        " x",
+        "x ",
+        "x\ny",
+        "a:b",
+        "a\\b",
+        "é",
+        "\x00",
+    ],
+)
+def test_invalid_session_ids_are_rejected_before_a_session_exists(session_id):
+    raw = json.dumps(
+        {"type": "prompt", "text": "hi", "session_id": session_id}
+    ).encode() + b"\n"
+
+    with pytest.raises(transport.PromptError) as excinfo:
+        transport.parse_prompt(raw)
+
+    assert excinfo.value.code == transport.ERR_INVALID_PROMPT
+
+
+def test_lone_surrogate_session_id_is_rejected():
+    raw = b'{"type":"prompt","text":"hi","session_id":"\\ud800"}\n'
+
+    with pytest.raises(transport.PromptError) as excinfo:
+        transport.parse_prompt(raw)
+
+    assert excinfo.value.code == transport.ERR_INVALID_PROMPT
 
 
 def test_missing_trailing_newline_is_accepted():
@@ -166,6 +223,40 @@ def test_chunking_handles_four_byte_characters():
     assert "".join(chunks) == text
     for chunk in chunks:
         assert len(chunk.encode("utf-8")) <= 16
+
+
+def _naive_chunk_text(text: str, limit: int) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    for character in text:
+        candidate = current + character
+        if current and len(candidate.encode("utf-8")) > limit:
+            chunks.append(current)
+            current = character
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+CHUNK_SAMPLES = {
+    "ascii": "The quick brown fox jumps over the lazy dog. " * 3,
+    "cjk": "日本語のテキストを分割します。" * 4,
+    "emoji": "\U0001f600\U0001f389\U0001f680" * 5,
+    "mixed": "héllo 漢字 😀 ok\n" * 5,
+}
+
+
+@pytest.mark.parametrize("sample", sorted(CHUNK_SAMPLES))
+@pytest.mark.parametrize("limit", [1, 2, 3, 4, 16, 4096, 16384])
+def test_chunking_matches_naive_splitter(sample, limit):
+    text = CHUNK_SAMPLES[sample]
+
+    chunks = transport.chunk_text(text, limit)
+
+    assert chunks == _naive_chunk_text(text, limit)
+    assert "".join(chunks) == text
 
 
 def test_chat_id_composition():

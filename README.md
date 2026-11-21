@@ -124,6 +124,8 @@ take effect for the next connection without a restart. See
 | `endpoint: not running` / `ticket: unavailable` | Platform disabled or the gateway has not restarted | Run `scripts/enable.sh`, then restart outside the gateway |
 | `hint:` names the missing SDK | `iroh` is not importable | `hermes plugins enable iroh-channel`, accept the dependency prompt, restart |
 | Client connects and is closed immediately | Node id not allowlisted | Run `/iroh_allow <node_id>` and reconnect |
+| Clients time out while connecting under load | Pending handshake admission cap reached | Retry; raise `HERMES_IROH_MAX_PENDING_HANDSHAKES` if the host has capacity |
+| Client gets `invalid_prompt` | `session_id` failed the grammar | Use only ASCII letters, digits, `_`, `.`, `-`, at most 128 characters, without `..` |
 
 For a reproducible install, pin the commit:
 
@@ -140,13 +142,21 @@ local filesystem path is not a supported source.
 
 State lives in the plugin directory itself, so nothing has to be configured: the
 plugin works wherever Hermes installed it, in whichever profile and `HERMES_HOME`.
-These are the three settings the manifest declares, all optional:
+These are the settings the manifest declares, all optional:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `HERMES_IROH_ALLOWLIST` | unset | Comma- or whitespace-separated node ids, unioned with the allowlist file |
 | `HERMES_IROH_RELAY` | unset | Relay mode: unset/blank for the n0 default relays, `disabled`/`off`/`none` to disable relaying, or a comma-separated relay URL list |
-| `HERMES_IROH_TURN_TIMEOUT` | `600` | Seconds to wait for a gateway turn before the stream fails with `timeout` |
+| `HERMES_IROH_TURN_TIMEOUT` | `600` | Seconds to wait for a gateway turn before the stream fails with `timeout`; finite values from `1` to `86400` |
+| `HERMES_IROH_MAX_PENDING_HANDSHAKES` | `32` | Concurrent incoming handshakes admitted before excess connections are refused |
+| `HERMES_IROH_MAX_STREAMS_PER_NODE` | `2` | Concurrent prompts allowed per authenticated node id |
+| `HERMES_IROH_MAX_PROMPTS_PER_MINUTE` | `30` | Prompts allowed per authenticated node id in a sliding 60-second window |
+| `HERMES_IROH_MAX_RESPONSE_BYTES` | `4194304` (4 MiB) | Response content bytes forwarded per turn before `response_too_large` |
+
+The four quota limits must be positive integers. `HERMES_IROH_TURN_TIMEOUT`
+must be finite and between 1 and 86400 seconds. An invalid value fails startup
+instead of silently falling back to the default.
 
 ### State directory and key file
 
@@ -160,6 +170,14 @@ path overrides exist: `HERMES_IROH_STATE_DIR` moves the directory, and
 - It is written atomically: a temporary sibling is `fsync`ed, `chmod 0600`, then
   renamed into place.
 - A newly created parent directory is `chmod 0700`.
+- The key file must be a regular file owned by the current user with no group or
+  other permission bits (`0600` or stricter). Symlinks and `0644`/`0660` keys are
+  refused, and the file is never modified or regenerated. Fix the mode with
+  `chmod 600 node.key` and restart.
+- The state directory must be owned by the current user and must not be group- or
+  world-writable. Writes fail with the path and the required ownership/mode. The
+  plugin directory in a checkout is often group-writable, so local runs should set
+  `HERMES_IROH_STATE_DIR` to a private directory (`chmod 700`).
 - If the file exists but is not a valid 32-byte key, startup fails and reports
   the path and the reason. The plugin never overwrites a malformed key and never
   silently changes its identity.
@@ -177,12 +195,19 @@ identity must outlive a reinstall.
 | unset or blank | `RelayMode.default_mode()` (n0 production relays) |
 | `disabled`, `off`, `none` | `RelayMode.disabled()` |
 | `https://relay.example.com,https://relay2.example.com` | `RelayMode.custom_from_urls([...])` with exactly those relays |
-| anything unparseable | Startup fails with a diagnostic naming the invalid value |
+| anything unparseable | Startup fails with a diagnostic naming the entry position and reason |
 
-Relay URLs must be absolute `http`/`https` URLs; empty list elements and other
-schemes are rejected before binding. With relaying disabled, the ticket still
-carries direct addresses, so clients on another network cannot connect unless a
-direct address is reachable.
+Relay URLs must be absolute `http`/`https` URLs with a non-empty hostname and a
+valid port. Empty list elements, other schemes, whitespace or control characters,
+and URLs with userinfo (`https://user:secret@relay.example.com`) are rejected
+before binding. Error messages name the entry position and the reason and never
+echo the raw value, so embedded credentials cannot leak through an exception.
+With relaying disabled, the ticket still carries direct addresses, so clients on
+another network cannot connect unless a direct address is reachable.
+
+Diagnostics are redacted: `/iroh_info`, startup logs, errors, and
+`RelayConfig.describe()` show only the scheme, host, port, and path. Userinfo,
+query strings, and fragments are omitted.
 
 ### Client allowlist
 
@@ -199,19 +224,34 @@ Behavior:
 
 - **Fail closed.** An absent, empty, or unparseable file plus an unset or empty
   environment variable yields an empty allowlist, which denies every client.
+- The file must be a regular file owned by the current user, must not be a
+  symlink, must not be group- or world-writable, and must be at most 1 MiB. A file
+  that fails these checks contributes no entries and logs a content-free warning;
+  environment entries still apply.
 - A malformed file logs a warning and contributes no file entries; environment
   entries still apply.
+- File and environment entries are validated as 64-character hexadecimal node
+  ids. Invalid entries are ignored and authorize no client; the warning reports
+  only a count.
 - The check runs on the authenticated QUIC `remote_id` immediately after the
   connection is established, before `accept_bi()` and before any prompt byte is
-  read. A rejected connection is closed immediately and no Hermes event is
-  created.
+  read. It runs again for every new stream before the prompt is read and again
+  before the session is created. A rejected connection or stream is closed and no
+  Hermes event is created.
+- Revocation applies to new streams on established connections: removing an entry
+  makes the next stream from that node fail with `unauthorized`. A turn that is
+  already running may finish. Re-adding the entry accepts new streams again.
 - Entries are deduplicated and persisted in normalized form. The file is
   rewritten atomically with mode `0600`.
 - The file is re-read when its mtime or size changes, so manual edits and
-  `/iroh_allow` take effect for new connections without a restart.
+  `/iroh_allow` take effect without a restart. Added and removed public node ids
+  are logged at `INFO` on reload.
 - Additions are validated as 64-character hexadecimal Iroh node ids (and through
   `EndpointId.from_string` when `iroh` is importable). Invalid values are refused
   and the allowlist is unchanged.
+- `/iroh_allow` refuses to rewrite a symlinked, wrong-owner, or group/world-
+  writable file. A malformed but otherwise safe file can still be repaired by an
+  explicit add.
 
 The environment variable is a bootstrap mechanism, for example a container
 secret. It does not replace the file, and nothing written by `/iroh_allow` goes
@@ -231,8 +271,18 @@ into the environment.
 - **No unsolicited messages.** The platform delivers only replies to an active
   prompt stream; `supports_async_delivery` is off and sending to a chat without
   an active stream fails with an error result.
-- **No secrets in logs.** Key material and allowlist contents are never logged;
-  failures name the path and the error class, not the data.
+- **Bounded work before authentication.** At most 32 incoming handshakes are in
+  flight; excess connections are refused or dropped without creating a handler
+  task. Transient accept failures retry with 0.05 s to 5 s exponential backoff
+  instead of stopping acceptance.
+- **Per-client quotas.** Each authenticated node id has a concurrent-prompt limit,
+  a prompt rate limit over a sliding 60-second window, and a per-turn response
+  byte cap. One noisy client cannot starve another.
+- **No secrets in logs.** Key material and relay credentials are never logged;
+  failures name the path and the error class, not the data. Public node ids may be
+  audited at `INFO` for allowlist changes, rejections, and quota decisions.
+  High-volume rejection records are throttled with a suppressed-count summary so
+  a flood cannot become a log-volume denial of service.
 
 ## Protocol
 
@@ -289,9 +339,13 @@ The client sends exactly one prompt per stream, as the first line:
 
 - `text` must be a non-empty string. It is sent verbatim as the user turn.
 - `session_id` is optional. Absent, `null`, blank, or whitespace-only values
-  become `default`. The value identifies a conversation within the client's node
-  id; use a stable per-conversation value to resume a conversation across
-  reconnects.
+  become `default`. A non-blank value must match
+  `^(?!.*\.\.)[A-Za-z0-9_.-]{1,128}$`: ASCII letters, digits, `_`, `.`, and `-`,
+  at most 128 characters, with no two consecutive dots. Surrounding whitespace is
+  not trimmed, so ` session` is invalid. The value identifies a conversation
+  within the client's node id; use a stable per-conversation value to resume a
+  conversation across reconnects. An invalid value yields `invalid_prompt` before
+  a session is created.
 - The prompt line is capped at 64 KiB (64 * 1024 bytes) before its trailing
   newline. A longer line yields `{"type":"error","message":"prompt_too_large"}`.
 - The client must send the newline (or close its send side) to finish the
@@ -337,16 +391,27 @@ without repair.
 | --- | --- |
 | Prompt line | 64 KiB |
 | Delta frame content | 16 KiB |
+| Response content per turn | 4 MiB (`HERMES_IROH_MAX_RESPONSE_BYTES`) |
 | Prompt read timeout | 30 s |
 | Turn timeout | 600 s (`HERMES_IROH_TURN_TIMEOUT`) |
+| Pending incoming handshakes | 32 (`HERMES_IROH_MAX_PENDING_HANDSHAKES`) |
 | Concurrent connections | 64 |
 | Streams per connection | 8 |
 | Total concurrent streams | 64 |
+| Concurrent prompts per node id | 2 (`HERMES_IROH_MAX_STREAMS_PER_NODE`) |
+| Prompts per node id per 60 s | 30 (`HERMES_IROH_MAX_PROMPTS_PER_MINUTE`) |
 | In-flight prompts per node id + session id | 1 |
 
 When a stream limit is reached the server answers the new stream with
 `{"type":"error","message":"too_many_streams"}` and keeps existing streams
-running.
+running. Exceeding the per-node prompt rate yields `rate_limited`. Exceeding the
+response cap yields one `response_too_large` terminal error and stops forwarding.
+Each node's quota is independent: one client reaching its limit does not block
+another.
+
+Acceptance is resilient: a transient endpoint accept error retries with bounded
+exponential backoff (0.05 s doubling to 5 s, reset after a success) instead of
+permanently stopping the accept loop.
 
 ### One in-flight prompt per session
 
@@ -364,13 +429,15 @@ Different session ids, or different node ids, run concurrently.
 
 | Value | Meaning |
 | --- | --- |
-| `invalid_prompt` | The first line is not a JSON object, is not type `prompt`, has empty or non-string `text`, or has a non-string `session_id` |
+| `invalid_prompt` | The first line is not a JSON object, is not type `prompt`, has empty or non-string `text`, has a non-string `session_id`, or has a `session_id` outside the accepted grammar |
 | `prompt_too_large` | The prompt line exceeded 64 KiB |
 | `session_busy` | Another prompt is already in flight for this node id and session id |
 | `timeout` | The prompt did not arrive within 30 s, or the turn produced no terminal frame within the turn timeout |
-| `unauthorized` | Reserved for authorization failures; unauthorized connections are closed before a stream exists |
+| `unauthorized` | The node's allowlist entry was removed before the stream started; no prompt is read and no Hermes event is created |
 | `internal_error` | Unclassified failure; no internal detail is sent |
-| `too_many_streams` | The per-connection or total stream limit was reached |
+| `too_many_streams` | The per-connection, total, or per-node concurrent-stream limit was reached |
+| `rate_limited` | The node exceeded `HERMES_IROH_MAX_PROMPTS_PER_MINUTE`; no turn starts |
+| `response_too_large` | The assistant response exceeded `HERMES_IROH_MAX_RESPONSE_BYTES`; forwarding stopped after one terminal error |
 
 ### Close behavior
 
@@ -484,8 +551,9 @@ hint: the endpoint is not connected; set gateway.platforms.iroh.enabled=true and
 - `ticket` is the dial string only while the endpoint is running.
 - `endpoint` is `running` after the platform connects and `not running` before
   the gateway restart or when the `iroh` package is missing.
-- `relay` shows `default`, `disabled`, the configured URL list, or
-  `invalid configuration` when the setting cannot be parsed.
+- `relay` shows `default`, `disabled`, the redacted custom URL list (scheme,
+  host, port, and path only), or `invalid configuration` when the setting cannot
+  be parsed. Userinfo and query strings never appear.
 - `allowlist entries` counts the effective union of the file and the environment.
 - `hint` appears only while the endpoint is not running. It names the missing
   SDK and the re-enable step, an unreadable key and the state directory, or the
@@ -504,9 +572,10 @@ normalized id:
 With no argument or with extra arguments it returns
 `usage: /iroh_allow <client_node_id>` and changes nothing. An invalid value
 returns `invalid node id: <reason>` and changes nothing. If the allowlist file
-cannot be written, it returns `could not update allowlist: <error class>` and
-changes nothing. Additions take effect for the next connection without a
-restart.
+cannot be written — including when it is a symlink, is not owned by the current
+user, is group- or world-writable, or the state directory is insecure — it
+returns `could not update allowlist: <error class>` and changes nothing.
+Additions take effect for the next stream without a restart.
 
 ## Delivery behavior and limitations
 
