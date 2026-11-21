@@ -1,7 +1,7 @@
 name: iroh-channel
 label: Iroh Channel
 kind: platform
-version: 1.2.0
+version: 1.3.0
 description: >
   Peer-to-peer Iroh channel for Hermes Agent. Clients dial the node by ticket and
   exchange newline-delimited JSON frames over an authenticated QUIC connection.
