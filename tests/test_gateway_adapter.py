@@ -1269,6 +1269,73 @@ def test_remember_tool_call_keeps_mapping_arguments():
     assert pending[0]["arguments"] is not arguments
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"query": NaN}',
+        '{"query": Infinity}',
+        '{"query": -Infinity}',
+    ],
+)
+def test_remember_tool_call_rejects_non_finite_json(arguments):
+    service = gateway_adapter.ChannelService()
+
+    service.remember_tool_call("hermes-s1", "call_nonfinite", "web_search", arguments)
+
+    assert service.pending_tool_calls("hermes-s1") == []
+
+
+def test_remember_tool_call_rejects_non_finite_float_mapping():
+    service = gateway_adapter.ChannelService()
+
+    service.remember_tool_call(
+        "hermes-s1", "call_nonfinite_mapping", "web_search", {"query": float("nan")}
+    )
+
+    assert service.pending_tool_calls("hermes-s1") == []
+
+
+def test_remember_tool_call_ignores_recursion_in_json_decode(monkeypatch):
+    service = gateway_adapter.ChannelService()
+
+    def raise_recursion(*args, **kwargs):
+        raise RecursionError
+
+    monkeypatch.setattr(gateway_adapter.json, "loads", raise_recursion)
+
+    service.remember_tool_call("hermes-s1", "call_deep_json", "web_search", "{}")
+
+    assert service.pending_tool_calls("hermes-s1") == []
+
+
+def test_remember_tool_call_ignores_recursion_in_argument_digest(monkeypatch):
+    service = gateway_adapter.ChannelService()
+
+    def raise_recursion(*args, **kwargs):
+        raise RecursionError
+
+    monkeypatch.setattr(gateway_adapter.json, "dumps", raise_recursion)
+
+    service.remember_tool_call(
+        "hermes-s1", "call_deep_mapping", "web_search", {"query": QUERY}
+    )
+
+    assert service.pending_tool_calls("hermes-s1") == []
+
+
+def test_tool_call_record_ignores_recursion_in_json_decode(monkeypatch):
+    def raise_recursion(*args, **kwargs):
+        raise RecursionError
+
+    monkeypatch.setattr(gateway_adapter.json, "loads", raise_recursion)
+    record = {
+        "id": "call_deep_history",
+        "function": {"name": "web_search", "arguments": "{}"},
+    }
+
+    assert gateway_adapter._tool_call_record(record) is None
+
+
 async def test_pre_tool_call_capture_covers_stale_agent_history(tmp_path):
     adapter, service = make_adapter(tmp_path)
     session, send = make_session(tmp_path)

@@ -407,8 +407,10 @@ class ChannelService:
             return
         if isinstance(arguments, str):
             try:
-                arguments = json.loads(arguments)
-            except (TypeError, ValueError):
+                arguments = json.loads(
+                    arguments, parse_constant=_reject_json_constant
+                )
+            except (TypeError, ValueError, RecursionError):
                 _debug_tool_frames(
                     "hook_capture",
                     session=_diagnostic_stream(session_id),
@@ -1213,6 +1215,11 @@ def _bound_tool_value(
     return "[unsupported]"
 
 
+def _reject_json_constant(value: str) -> None:
+    """Reject non-finite JSON constants that Python accepts by default."""
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
 def _json_size(value: Any) -> int:
     return len(
         json.dumps(
@@ -1280,8 +1287,10 @@ def _tool_call_record(call: Any) -> Optional[dict]:
         raw_arguments = _read_field(call, "arguments", "args")
     if isinstance(raw_arguments, str):
         try:
-            raw_arguments = json.loads(raw_arguments)
-        except (TypeError, ValueError):
+            raw_arguments = json.loads(
+                raw_arguments, parse_constant=_reject_json_constant
+            )
+        except (TypeError, ValueError, RecursionError):
             return None
     if not isinstance(raw_arguments, Mapping):
         return None
@@ -1378,8 +1387,8 @@ def _raw_file_selector(tail: str) -> Optional[str]:
             body = body[: close.start()].strip()
         if body.startswith("{"):
             try:
-                decoded = json.loads(body)
-            except (TypeError, ValueError):
+                decoded = json.loads(body, parse_constant=_reject_json_constant)
+            except (TypeError, ValueError, RecursionError):
                 decoded = None
             if isinstance(decoded, Mapping):
                 path = decoded.get("path")
@@ -1506,10 +1515,13 @@ def _line_matches_record(line: str, record: Mapping) -> bool:
 
 
 def _tool_call_key(record: Mapping) -> str:
+    content_key = _tool_call_content_key(record)
+    if not content_key:
+        return ""
     identifier = record.get("id")
     if isinstance(identifier, str) and identifier:
         return f"id:{identifier}"
-    return _tool_call_content_key(record)
+    return content_key
 
 
 def _tool_call_content_key(record: Mapping) -> str:
@@ -1520,8 +1532,9 @@ def _tool_call_content_key(record: Mapping) -> str:
             ensure_ascii=True,
             separators=(",", ":"),
             default=str,
+            allow_nan=False,
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return ""
     digest = hashlib.sha256(
         f"{record.get('name')}\0{encoding}".encode("utf-8")
