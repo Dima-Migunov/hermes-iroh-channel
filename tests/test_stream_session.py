@@ -103,6 +103,68 @@ async def test_empty_append_writes_nothing():
     assert len(send.frames()) == 1
 
 
+async def test_tool_frame_precedes_delta_and_done():
+    session, send = make_session()
+    await session.start()
+
+    assert await session.emit_tool("call_1", "web_search", {"query": "q"}) is True
+    await session.append("progress")
+    await session.finish()
+
+    assert [frame["type"] for frame in send.frames()] == [
+        "start",
+        "tool",
+        "delta",
+        "done",
+    ]
+    assert send.frames()[1] == {
+        "type": "tool",
+        "id": "call_1",
+        "name": "web_search",
+        "arguments": {"query": "q"},
+    }
+    assert session.tool_frames_sent == 1
+
+
+async def test_tool_frame_after_terminal_is_dropped():
+    session, send = make_session()
+    await session.start()
+    await session.finish()
+
+    assert await session.emit_tool("call_1", "web_search", {"query": "q"}) is False
+
+    assert [frame["type"] for frame in send.frames()] == ["start", "done"]
+    assert session.tool_frames_sent == 0
+
+
+async def test_tool_frame_does_not_consume_the_text_budget():
+    session, send = make_session(max_response_bytes=1)
+    await session.start()
+
+    assert await session.emit_tool("call_1", "web_search", {"query": "q"}) is True
+    await session.append("x")
+    await session.finish()
+
+    assert [frame["type"] for frame in send.frames()] == [
+        "start",
+        "tool",
+        "delta",
+        "done",
+    ]
+    assert session.terminal is True
+    assert session.bytes_sent == 1
+    assert session.tool_bytes_sent > 0
+
+
+async def test_tool_frame_with_invalid_arguments_writes_nothing():
+    session, send = make_session()
+    await session.start()
+
+    assert await session.emit_tool("call_1", "web_search", "not-an-object") is False
+
+    assert [frame["type"] for frame in send.frames()] == ["start"]
+
+
 async def test_duplicate_terminal_is_suppressed():
     session, send = make_session()
     await session.start()

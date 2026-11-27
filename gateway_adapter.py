@@ -10,11 +10,16 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import dataclasses
+import hashlib
 import inspect
+import json
 import logging
 import math
 import os
+import re
+import threading
 import time
+from collections import deque
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +53,82 @@ SEGMENT_SEPARATOR = "\n\n"
 METADATA_SCHEMA = 1
 METADATA_STRING_MAX = 256
 MICROS_PER_USD = 1_000_000
+
+# Structured tool frames: display data only, bounded before the transport applies
+# its own 16 KiB frame guard.
+TOOL_ARG_MAX_BYTES = 15 * 1024
+TOOL_ARG_STRING_MAX = 2048
+TOOL_ARG_KEYS_MAX = 24
+TOOL_ARG_ITEMS_MAX = 24
+TOOL_ARG_DEPTH_MAX = 4
+TOOL_MATCH_PREFIX = 24
+TOOL_MATCH_MIN = 8
+TOOL_ANNOUNCED_MAX = 256
+TOOL_HISTORY_MESSAGES = 12
+TOOL_PENDING_MAX = 32
+TOOL_PENDING_TTL = 300.0
+
+_TOOL_SECRET_KEY_PARTS = (
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "api_key",
+    "apikey",
+    "authorization",
+    "cookie",
+    "credential",
+    "private_key",
+    "access_key",
+    "client_secret",
+    "session_key",
+)
+
+# Payload-shaped keys are not needed for a tooltip and may contain whole files
+# or binary data.
+_TOOL_OMIT_KEYS = frozenset(
+    {
+        "content",
+        "file_content",
+        "new_content",
+        "old_content",
+        "new_str",
+        "old_str",
+        "new_string",
+        "old_string",
+        "new_text",
+        "old_text",
+        "file_text",
+        "text_content",
+        "patch",
+        "diff",
+        "data",
+        "body",
+        "stdin",
+        "base64",
+        "blob",
+        "bytes",
+        "image",
+        "image_data",
+        "audio",
+        "video",
+        "file",
+        "files",
+        "attachments",
+    }
+)
+
+_TOOL_SECRET_VALUE_PATTERNS = (
+    re.compile(
+        r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|authorization|bearer)"
+        r"\b\s*[:=]\s*[\"']?[A-Za-z0-9_\-./+=]{8,}"
+    ),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
+)
 
 _USAGE_FIELDS = (
     ("input_tokens", ("input_tokens", "prompt_tokens")),
@@ -116,6 +197,9 @@ class ChannelService:
         self.server: Optional[transport.ChannelServer] = None
         self._lifecycle_lock: Optional[asyncio.Lock] = None
         self.router = ResponseRouter()
+        self._announced_tools: dict[str, set[str]] = {}
+        self._pending_tools: dict[str, deque] = {}
+        self._pending_lock = threading.Lock()
 
     @classmethod
     def get(cls) -> "ChannelService":
@@ -126,6 +210,87 @@ class ChannelService:
     @classmethod
     def reset(cls) -> None:
         cls._instance = None
+
+    def reset_tool_tracking(self, chat_id: str) -> None:
+        self._announced_tools.pop(chat_id, None)
+
+    def release_tool_tracking(self, chat_id: str) -> None:
+        self._announced_tools.pop(chat_id, None)
+
+    def mark_tool_announced(self, chat_id: str, key: str) -> bool:
+        """Return True the first time ``key`` is seen for this stream."""
+        if not key:
+            return False
+        announced = self._announced_tools.setdefault(chat_id, set())
+        if key in announced:
+            return False
+        if len(announced) >= TOOL_ANNOUNCED_MAX:
+            announced.clear()
+        announced.add(key)
+        return True
+
+    def tool_announced(self, chat_id: str, key: str) -> bool:
+        return key in self._announced_tools.get(chat_id, ())
+
+    def remember_tool_call(
+        self,
+        session_id: str,
+        tool_call_id: str,
+        name: str,
+        arguments: Any,
+    ) -> None:
+        """Remember one pre-execution tool call for a later progress line.
+
+        Values are kept in memory only and never logged. Duplicate ids are
+        ignored, and each session keeps a bounded, expiring queue.
+        """
+        if not isinstance(session_id, str) or not session_id:
+            return
+        if not isinstance(name, str) or not name:
+            return
+        if not isinstance(arguments, Mapping):
+            return
+        record = {
+            "id": tool_call_id if isinstance(tool_call_id, str) else "",
+            "name": name,
+            "arguments": dict(arguments),
+        }
+        key = _tool_call_key(record)
+        if not key:
+            return
+        with self._pending_lock:
+            queue = self._pending_tools.setdefault(
+                session_id, deque(maxlen=TOOL_PENDING_MAX)
+            )
+            if any(item.get("key") == key for item in queue):
+                return
+            record["key"] = key
+            record["ts"] = time.monotonic()
+            queue.append(record)
+
+    def pending_tool_calls(self, session_id: str) -> list[dict]:
+        if not isinstance(session_id, str) or not session_id:
+            return []
+        cutoff = time.monotonic() - TOOL_PENDING_TTL
+        with self._pending_lock:
+            queue = self._pending_tools.get(session_id)
+            if not queue:
+                return []
+            return [item for item in queue if item.get("ts", 0.0) >= cutoff]
+
+    def forget_tool_call(self, session_id: str, key: str) -> None:
+        with self._pending_lock:
+            queue = self._pending_tools.get(session_id)
+            if not queue:
+                return
+            remaining = deque(
+                (item for item in queue if item.get("key") != key),
+                maxlen=TOOL_PENDING_MAX,
+            )
+            if remaining:
+                self._pending_tools[session_id] = remaining
+            else:
+                self._pending_tools.pop(session_id, None)
 
     async def start(self) -> transport.ChannelServer:
         if self._lifecycle_lock is None:
@@ -164,6 +329,7 @@ class ChannelService:
         )
         if current is None or current is session:
             self.router.release(session.chat_id)
+            self.release_tool_tracking(session.chat_id)
 
     def node_id(self) -> str:
         return self.key_store.node_id()
@@ -761,6 +927,307 @@ def _execution_usage(value: Any) -> Any:
     return value
 
 
+def _oneline_text(text: str) -> str:
+    return " ".join(str(text).split())
+
+
+def _is_secret_key(name: str) -> bool:
+    normalized = str(name).lower().replace("-", "_")
+    return any(part in normalized for part in _TOOL_SECRET_KEY_PARTS)
+
+
+def _clip_utf8(text: str, limit: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf-8", "ignore") + "\u2026"
+
+
+def _redact_secret_values(text: str) -> str:
+    for pattern in _TOOL_SECRET_VALUE_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    return text
+
+
+def _bound_tool_value(value: Any, depth: int, truncated: list[bool]) -> Any:
+    if depth > TOOL_ARG_DEPTH_MAX:
+        truncated[0] = True
+        return "[truncated]"
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        truncated[0] = True
+        return "[unsupported]"
+    if isinstance(value, str):
+        clipped = _clip_utf8(value, TOOL_ARG_STRING_MAX)
+        redacted = _redact_secret_values(clipped)
+        if redacted != value:
+            truncated[0] = True
+        return redacted
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= TOOL_ARG_KEYS_MAX:
+                truncated[0] = True
+                break
+            name = str(key)[:128]
+            normalized = name.lower().replace("-", "_")
+            if normalized in _TOOL_OMIT_KEYS:
+                result[name] = "[omitted]"
+                truncated[0] = True
+            elif _is_secret_key(name):
+                result[name] = "[redacted]"
+            else:
+                result[name] = _bound_tool_value(item, depth + 1, truncated)
+        return result
+    if isinstance(value, (list, tuple)):
+        result_list = []
+        for index, item in enumerate(value):
+            if index >= TOOL_ARG_ITEMS_MAX:
+                truncated[0] = True
+                break
+            result_list.append(_bound_tool_value(item, depth + 1, truncated))
+        return result_list
+    truncated[0] = True
+    return "[unsupported]"
+
+
+def _json_size(value: Any) -> int:
+    return len(
+        json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    )
+
+
+def _bound_tool_arguments(arguments: Any) -> Optional[tuple[dict, bool]]:
+    """Return ``(object, truncated)`` or None when no safe object can be built."""
+    if not isinstance(arguments, Mapping):
+        return None
+    truncated = [False]
+    bounded = _bound_tool_value(arguments, 0, truncated)
+    if not isinstance(bounded, dict):
+        return None
+    for key in list(bounded):
+        try:
+            size = _json_size(bounded[key])
+        except (TypeError, ValueError):
+            return None
+        if size > TOOL_ARG_MAX_BYTES:
+            bounded[key] = "[truncated]"
+            truncated[0] = True
+    while bounded:
+        try:
+            total = _json_size(bounded)
+        except (TypeError, ValueError):
+            return None
+        if total <= TOOL_ARG_MAX_BYTES:
+            break
+        bounded.popitem()
+        truncated[0] = True
+    if not bounded and arguments:
+        return None
+    return bounded, truncated[0]
+
+
+def _agent_history(agent: Any) -> list:
+    best: list = []
+    for name in (
+        "_session_messages",
+        "messages",
+        "_messages",
+        "conversation_history",
+        "_conversation_history",
+        "history",
+    ):
+        value = _read_field(agent, name)
+        if isinstance(value, list) and len(value) > len(best):
+            best = value
+    return best
+
+
+def _tool_call_record(call: Any) -> Optional[dict]:
+    function = _read_field(call, "function")
+    name = _read_field(function, "name")
+    if name is None:
+        name = _read_field(call, "name", "tool_name")
+    raw_arguments = _read_field(function, "arguments")
+    if raw_arguments is None:
+        raw_arguments = _read_field(call, "arguments", "args")
+    if isinstance(raw_arguments, str):
+        try:
+            raw_arguments = json.loads(raw_arguments)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(raw_arguments, Mapping):
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+    identifier = _read_field(call, "id", "tool_call_id")
+    return {
+        "id": identifier if isinstance(identifier, str) else "",
+        "name": name,
+        "arguments": dict(raw_arguments),
+    }
+
+
+def _recent_tool_calls(messages: list) -> list[dict]:
+    records: list[dict] = []
+    start = max(0, len(messages) - TOOL_HISTORY_MESSAGES)
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, Mapping) and message.get("role") == "user":
+            start = index + 1
+            break
+    for message in messages[start:]:
+        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+            continue
+        calls = _read_field(message, "tool_calls")
+        if not isinstance(calls, (list, tuple)):
+            continue
+        for call in calls:
+            record = _tool_call_record(call)
+            if record is not None:
+                records.append(record)
+    return records
+
+
+def _argument_strings(value: Any, depth: int = 0) -> list[str]:
+    if depth > TOOL_ARG_DEPTH_MAX:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        strings: list[str] = []
+        for item in value.values():
+            strings.extend(_argument_strings(item, depth + 1))
+            if len(strings) >= 16:
+                break
+        return strings[:16]
+    if isinstance(value, (list, tuple)):
+        strings = []
+        for item in value:
+            strings.extend(_argument_strings(item, depth + 1))
+            if len(strings) >= 16:
+                break
+        return strings[:16]
+    return []
+
+
+def _line_matches_arguments(line: str, arguments: Mapping) -> bool:
+    normalized_line = _oneline_text(line)
+    if not normalized_line:
+        return False
+    for value in _argument_strings(arguments):
+        normalized = _oneline_text(value)
+        if len(normalized) < TOOL_MATCH_MIN:
+            continue
+        if normalized[:TOOL_MATCH_PREFIX] in normalized_line:
+            return True
+    return False
+
+
+def _tool_call_key(record: Mapping) -> str:
+    identifier = record.get("id")
+    if isinstance(identifier, str) and identifier:
+        return f"id:{identifier}"
+    return _tool_call_content_key(record)
+
+
+def _tool_call_content_key(record: Mapping) -> str:
+    try:
+        encoding = json.dumps(
+            record.get("arguments"),
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except (TypeError, ValueError):
+        return ""
+    digest = hashlib.sha256(
+        f"{record.get('name')}\0{encoding}".encode("utf-8")
+    ).hexdigest()
+    return f"args:{digest}"
+
+
+def _progress_lines(delta: str) -> list[str]:
+    return [line.strip() for line in delta.splitlines() if line.strip()]
+
+
+def collect_tool_frames(
+    service: ChannelService,
+    adapter: Any,
+    session: transport.StreamSession,
+    delta: str,
+) -> list[dict]:
+    """Best-effort structured tool calls for the progress lines in ``delta``.
+
+    The rendered line is only a selector: the payload always comes from the
+    recorded arguments. No history, no match, or an ambiguous match yields an
+    empty list and leaves the text stream untouched.
+    """
+    lines = _progress_lines(delta)
+    if not lines or adapter is None:
+        return []
+    source = _session_source(adapter, session)
+    agent = _live_agent(adapter, source)
+    if agent is None:
+        return []
+    agent_session_id = _read_field(agent, "session_id")
+    if not isinstance(agent_session_id, str):
+        agent_session_id = ""
+    records: list[dict] = []
+    seen_keys: set[str] = set()
+    seen_content: set[str] = set()
+    for record in (
+        *service.pending_tool_calls(agent_session_id),
+        *_recent_tool_calls(_agent_history(agent)),
+    ):
+        key = _tool_call_key(record)
+        content_key = _tool_call_content_key(record)
+        if not key or key in seen_keys or content_key in seen_content:
+            continue
+        seen_keys.add(key)
+        if content_key:
+            seen_content.add(content_key)
+        records.append(record)
+    if not records:
+        return []
+    frames: list[dict] = []
+    for line in lines:
+        matches: list[dict] = []
+        for record in records:
+            key = _tool_call_key(record)
+            if not key or service.tool_announced(session.chat_id, key):
+                continue
+            if _line_matches_arguments(line, record["arguments"]):
+                matches.append(record)
+        if len(matches) != 1:
+            continue
+        record = matches[0]
+        key = _tool_call_key(record)
+        service.mark_tool_announced(session.chat_id, key)
+        service.forget_tool_call(agent_session_id, key)
+        prepared = _bound_tool_arguments(record["arguments"])
+        if prepared is None:
+            continue
+        arguments, truncated = prepared
+        frames.append(
+            {
+                "id": str(record["id"])[:128],
+                "name": record["name"],
+                "arguments": arguments,
+                "truncated": truncated,
+            }
+        )
+    return frames
+
+
 async def collect_response_metadata(
     adapter: Any,
     session: transport.StreamSession,
@@ -789,10 +1256,37 @@ async def deliver_message(
     metadata_factory: Optional[
         Callable[[transport.StreamSession], Any]
     ] = None,
+    tool_frames_factory: Optional[
+        Callable[[transport.StreamSession, str], Any]
+    ] = None,
 ) -> None:
     if session.terminal:
         return
     delta = service.router.consume(session.chat_id, content)
+    if delta and tool_frames_factory is not None:
+        frames: Any = None
+        try:
+            frames = tool_frames_factory(session, delta)
+            if inspect.isawaitable(frames):
+                frames = await frames
+        except Exception as exc:
+            logger.debug(
+                "iroh tool frame collection failed: %s", type(exc).__name__
+            )
+            frames = None
+        for frame in frames or ():
+            if not isinstance(frame, Mapping):
+                continue
+            name = frame.get("name")
+            arguments = frame.get("arguments")
+            if not isinstance(name, str) or not isinstance(arguments, Mapping):
+                continue
+            await session.emit_tool(
+                frame.get("id") if isinstance(frame.get("id"), str) else "",
+                name,
+                dict(arguments),
+                truncated=bool(frame.get("truncated")),
+            )
     if delta:
         await session.append(delta)
     if finalize and service.router.mark_terminal(session.chat_id):
@@ -808,6 +1302,7 @@ async def deliver_message(
                 metadata = None
         await session.finish(metadata=metadata)
         service.router.release(session.chat_id)
+        service.release_tool_tracking(session.chat_id)
 
 
 def build_prompt_handler(
@@ -819,6 +1314,7 @@ def build_prompt_handler(
         source = _stream_source(adapter, session)
         event = event_factory(text=text, source=source)
         service.router.reset(session.chat_id)
+        service.reset_tool_tracking(session.chat_id)
         try:
             await adapter.handle_message(event)
         except Exception:
@@ -907,7 +1403,13 @@ def build_adapter_class(
             session = self._session(chat_id)
             if session is None:
                 return _no_active_stream_result(send_result)
-            meta = metadata or {}
+            meta = metadata if isinstance(metadata, Mapping) else {}
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "iroh send metadata keys: %s content_length=%d",
+                    sorted(str(key) for key in meta),
+                    len(content),
+                )
             finalize = bool(meta.get("notify") or meta.get("final"))
             if meta.get("_interim_send"):
                 finalize = False
@@ -938,8 +1440,14 @@ def build_adapter_class(
                 content,
                 finalize=finalize,
                 metadata_factory=self._response_metadata,
+                tool_frames_factory=self._tool_frames if not finalize else None,
             )
             return send_result(success=True, message_id=session.chat_id)
+
+        def _tool_frames(
+            self, session: transport.StreamSession, delta: str
+        ) -> list[dict]:
+            return collect_tool_frames(service, self, session, delta)
 
         async def _response_metadata(
             self, session: transport.StreamSession
@@ -983,6 +1491,31 @@ def register(ctx: Any) -> None:
         )
 
     service = ChannelService.get()
+
+    def _remember_tool_call(**kwargs: Any) -> None:
+        """Observer-only ``pre_tool_call`` hook: keep full args for a later line."""
+        try:
+            service.remember_tool_call(
+                kwargs.get("session_id", ""),
+                kwargs.get("tool_call_id", ""),
+                kwargs.get("tool_name", ""),
+                kwargs.get("args"),
+            )
+        except Exception as exc:
+            logger.debug(
+                "iroh tool-call capture skipped: %s", type(exc).__name__
+            )
+        return None
+
+    register_hook = getattr(ctx, "register_hook", None)
+    if callable(register_hook):
+        try:
+            register_hook("pre_tool_call", _remember_tool_call)
+        except Exception as exc:
+            logger.debug(
+                "iroh pre_tool_call hook registration skipped: %s",
+                type(exc).__name__,
+            )
 
     def _adapter_factory(config: Any) -> Any:
         # Hermes only accepts the platform name after ctx.register_platform has

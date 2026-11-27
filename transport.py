@@ -30,6 +30,7 @@ DEFAULT_SESSION_ID = "default"
 
 MAX_PROMPT_BYTES = 64 * 1024
 MAX_DELTA_BYTES = 16 * 1024
+MAX_TOOL_FRAME_BYTES = 16 * 1024
 MAX_METADATA_BYTES = 4096
 PROMPT_READ_CHUNK = 4096
 
@@ -747,6 +748,39 @@ def delta_frame(content: str) -> dict:
     return {"type": "delta", "content": content}
 
 
+def tool_frame(
+    tool_id: str,
+    name: str,
+    arguments: dict,
+    *,
+    truncated: bool = False,
+) -> Optional[dict]:
+    """Build one bounded ``tool`` frame, or None when it cannot be sent safely.
+
+    Arguments are display data: an oversized, non-object, or unencodable payload
+    is dropped rather than split, because a client must never see a partial JSON
+    object. Values are not logged.
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    frame: dict = {"type": "tool"}
+    if isinstance(tool_id, str) and tool_id:
+        frame["id"] = tool_id
+    frame["name"] = name
+    frame["arguments"] = arguments
+    if truncated:
+        frame["truncated"] = True
+    try:
+        encoded = encode_frame(frame)
+    except (TypeError, ValueError):
+        return None
+    if len(encoded) > MAX_TOOL_FRAME_BYTES:
+        return None
+    return frame
+
+
 def done_frame(metadata: Optional[dict] = None) -> dict:
     if not metadata:
         return {"type": "done"}
@@ -896,7 +930,9 @@ class StreamSession:
         self.slash_prompt = False
         self.cancelled = False
         self.deltas_sent = 0
+        self.tool_frames_sent = 0
         self.bytes_sent = 0
+        self.tool_bytes_sent = 0
         self.started_monotonic = time.monotonic()
 
     def _can_write(self) -> bool:
@@ -930,6 +966,33 @@ class StreamSession:
             await self._write(delta_frame(chunk))
             self.deltas_sent += 1
             self.bytes_sent += size
+
+    async def emit_tool(
+        self,
+        tool_id: str,
+        name: str,
+        arguments: dict,
+        *,
+        truncated: bool = False,
+    ) -> bool:
+        """Write one optional ``tool`` frame before the terminal frame.
+
+        Returns False when the session is closed or the payload cannot be encoded
+        within the 16 KiB frame limit. A skipped frame is presentation data only:
+        the text stream keeps going, and frames do not consume its byte budget.
+        """
+        if not self._can_write():
+            return False
+        frame = tool_frame(tool_id, name, arguments, truncated=truncated)
+        if frame is None:
+            return False
+        size = len(encode_frame(frame))
+        await self._write(frame)
+        if self.cancelled:
+            return False
+        self.tool_frames_sent += 1
+        self.tool_bytes_sent += size
+        return True
 
     async def finish(self, metadata: Optional[dict] = None) -> None:
         if not self._can_write():

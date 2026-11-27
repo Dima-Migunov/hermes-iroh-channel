@@ -355,6 +355,7 @@ for forward compatibility.
 | --- | --- | --- |
 | `prompt` | client → server | `type`: `"prompt"`, `text`: non-empty string, `session_id`: optional string |
 | `start` | server → client | `type`: `"start"`, `session_id`: the session id used |
+| `tool` | server → client | `type`: `"tool"`, `id`: tool-call id when available, `name`: tool name, `arguments`: JSON object, `truncated`: optional `true` |
 | `delta` | server → client | `type`: `"delta"`, `content`: string chunk of response text |
 | `done` | server → client | `type`: `"done"`, `metadata`: optional object |
 | `error` | server → client | `type`: `"error"`, `message`: stable error value |
@@ -364,6 +365,8 @@ Documented examples (each is one exact line ending with `\n`):
 ```json
 {"type":"prompt","session_id":"default","text":"hello"}
 {"type":"start","session_id":"default"}
+{"type":"tool","id":"call_1","name":"web_search","arguments":{"query":"heavy lift voyage analysis"}}
+{"type":"delta","content":"🔍 Searching the web for \"heavy lift voyage analy...\""}
 {"type":"delta","content":"Hello! How can I help?"}
 {"type":"done"}
 {"type":"error","message":"session_busy"}
@@ -400,7 +403,8 @@ The server waits 30 seconds for the prompt line, then fails the stream with
 For every accepted prompt the server sends:
 
 1. exactly one `start` frame carrying the session id, before any text;
-2. zero or more `delta` frames, in order;
+2. zero or more `tool` frames and zero or more `delta` frames, with every
+   `tool` frame placed before the `delta` that carries its progress line;
 3. exactly one terminal frame: `done` on success or `error` on failure.
 
 No frame follows the terminal frame. The server finishes its send side after the
@@ -408,7 +412,8 @@ terminal frame; the client observes end-of-stream.
 
 An empty agent response is `start` immediately followed by `done`. A successful
 `done` frame may also carry an optional `metadata` object; see
-[Response metadata](#response-metadata).
+[Response metadata](#response-metadata). A `tool` frame never replaces or changes
+`delta` content: concatenating `delta.content` still reconstructs the same text.
 
 ### Response metadata
 
@@ -451,6 +456,56 @@ the frame is exactly `{"type":"done"}` when no metadata is available.
   core yields fewer fields, and a collection failure still produces a normal
   `done`.
 
+### Tool call frames
+
+A `tool` frame is optional structured data for a tool call whose human-readable
+progress line is truncated (for example with `...`). It is sent only when the
+server can recover the recorded arguments from the live Hermes agent; otherwise
+no frame is sent and the text stream is unchanged.
+
+```json
+{"type":"tool","id":"call_abc123","name":"web_search","arguments":{"query":"heavy lift project cargo vessel voyage analysis"}}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `type` | string | Always `"tool"` |
+| `id` | string | Hermes tool-call id when available; omitted when Hermes exposes none |
+| `name` | string | Tool name exactly as Hermes recorded it |
+| `arguments` | object | Bounded, redacted copy of the recorded tool arguments |
+| `truncated` | boolean | Present and `true` when any value was clipped, redacted, or dropped |
+
+- A `tool` frame appears after `start` and before the `delta` frame whose content
+  contains the corresponding progress line. The frame and the line describe the
+  same call; a client SHOULD attach the frame to the next new progress line it
+  receives. When one delta carries several new progress lines, their frames are
+  sent in line order immediately before that delta.
+- A tool call is announced at most once per response. Cumulative progress edits
+  do not repeat a frame, and no `tool` frame follows `done` or `error`.
+- The frame is display data only. `delta.content` must not be edited, reordered,
+  or reconstructed from it, and the client MUST NOT execute or replay the
+  arguments.
+- The encoded frame is capped at 16 KiB (16 * 1024 bytes). Values whose key names
+  indicate credentials or secrets (for example `api_key`, `token`, `password`,
+  `authorization`, `client_secret`) are replaced with `"[redacted]"`, and
+  secret-shaped values embedded in longer strings are redacted too. Payload keys
+  such as `content`, `patch`, or `data` become `"[omitted]"` so file and binary
+  contents are not forwarded. Overlong strings and collections are trimmed,
+  unsupported values become `"[unsupported]"`, and the frame carries
+  `"truncated":true`.
+- Tool frames do not consume the assistant-text response budget. A client that
+  does not understand `tool` ignores it and sees exactly the same `delta` text and
+  exactly one terminal frame.
+- Absence of a `tool` frame means "no structured data"; it never means an empty
+  tool call. Some tool calls produce no progress line or no recoverable history.
+
+Recommended client history model: keep the assistant message `content` exactly
+as received, and store a parallel list such as
+`toolCalls: [{ id, name, arguments, truncated, lineIndex }]` keyed by the progress
+line's index in that message. Render the stored `arguments` in the tooltip for
+that line. If a history entry predates this frame or has no matching entry, show
+the line as-is.
+
 ### Append-only delta semantics
 
 Delta content is concatenated in arrival order to reconstruct the reply:
@@ -474,6 +529,7 @@ without repair.
 | --- | --- |
 | Prompt line | 64 KiB |
 | Delta frame content | 16 KiB |
+| Tool frame | 16 KiB |
 | Response content per turn | 4 MiB (`HERMES_IROH_MAX_RESPONSE_BYTES`) |
 | Response metadata per `done` frame | 4096 bytes |
 | Prompt read timeout | 30 s |
@@ -485,6 +541,9 @@ without repair.
 | Concurrent prompts per node id | 2 (`HERMES_IROH_MAX_STREAMS_PER_NODE`) |
 | Prompts per node id per 60 s | 30 (`HERMES_IROH_MAX_PROMPTS_PER_MINUTE`) |
 | In-flight prompts per node id + session id | 1 |
+
+The `tool` frame limit is per frame. Tool frames are presentation data and do
+not consume the 4 MiB assistant-text budget.
 
 When a stream limit is reached the server answers the new stream with
 `{"type":"error","message":"too_many_streams"}` and keeps existing streams
@@ -573,6 +632,13 @@ async def main(ticket: str) -> None:
             frame = json.loads(line)
             if frame["type"] == "delta":
                 print(frame["content"], end="", flush=True)
+            elif frame["type"] == "tool":
+                # Keep for the tooltip; never modify the delta text.
+                print(
+                    f"\n[tool {frame.get('id', '')}] {frame['name']}: "
+                    f"{json.dumps(frame['arguments'], ensure_ascii=False)}",
+                    flush=True,
+                )
             elif frame["type"] == "done":
                 print()
             elif frame["type"] == "error":
@@ -585,8 +651,8 @@ asyncio.run(main("<ticket from /iroh_info>"))
 ```
 
 Sequence: dial by ticket → `open_bi` → send one `prompt` line → read `start`,
-`delta`…, terminal frame → close the stream. The client may close as soon as it
-has the terminal frame.
+`tool`/`delta`…, terminal frame → close the stream. The client may close as soon
+as it has the terminal frame.
 
 ### Session keying
 

@@ -663,6 +663,371 @@ class ProbeAgent:
 
 
 # --------------------------------------------------------------------------- #
+# Tool-call frames
+# --------------------------------------------------------------------------- #
+
+
+def tool_agent(*calls, session_id="s1"):
+    messages = [
+        {"role": "user", "content": "find it"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(arguments),
+                    },
+                }
+                for call_id, name, arguments in calls
+            ],
+        },
+    ]
+    return SimpleNamespace(_session_messages=messages, session_id=session_id)
+
+
+QUERY = "heavy lift project cargo vessel voyage analysis"
+PROGRESS = '🔍 Searching the web for "heavy lift project cargo vessel voya..."'
+
+
+async def test_tool_frame_carries_the_full_query_before_the_progress_delta(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: tool_agent(("call_1", "web_search", {"query": QUERY}))}
+    )
+
+    await adapter.send(session.chat_id, PROGRESS)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1] == {
+        "type": "tool",
+        "id": "call_1",
+        "name": "web_search",
+        "arguments": {"query": QUERY},
+    }
+    assert frames[2] == {"type": "delta", "content": PROGRESS}
+
+
+async def test_missing_history_keeps_the_text_stream_unchanged(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner({session.chat_id: SimpleNamespace()})
+
+    await adapter.send(session.chat_id, PROGRESS)
+
+    assert [frame["type"] for frame in send.frames()] == ["start", "delta"]
+    assert send.frames()[1] == {"type": "delta", "content": PROGRESS}
+
+
+async def test_no_live_agent_keeps_the_text_stream_unchanged(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+
+    await adapter.send(session.chat_id, PROGRESS)
+
+    assert [frame["type"] for frame in send.frames()] == ["start", "delta"]
+
+
+async def test_malformed_tool_arguments_are_ignored(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    agent = SimpleNamespace(
+        _session_messages=[
+            {"role": "user", "content": "find it"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": "{not valid json",
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    adapter.gateway_runner = FakeRunner({session.chat_id: agent})
+
+    await adapter.send(session.chat_id, PROGRESS)
+
+    assert [frame["type"] for frame in send.frames()] == ["start", "delta"]
+
+
+async def test_secret_shaped_arguments_are_redacted_and_not_logged(
+    tmp_path, caplog
+):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                (
+                    "call_1",
+                    "web_search",
+                    {"query": QUERY, "api_key": "sk-live-secret-value"},
+                )
+            )
+        }
+    )
+    caplog.set_level(logging.DEBUG, logger="gateway_adapter")
+
+    await adapter.send(session.chat_id, PROGRESS)
+
+    tool = next(frame for frame in send.frames() if frame["type"] == "tool")
+    assert tool["arguments"]["query"] == QUERY
+    assert tool["arguments"]["api_key"] == "[redacted]"
+    assert "sk-live-secret-value" not in caplog.text
+
+
+async def test_oversized_arguments_are_bounded_and_marked_truncated(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                (
+                    "call_1",
+                    "execute_code",
+                    {"code": "x" * (transport.MAX_TOOL_FRAME_BYTES * 2)},
+                )
+            )
+        }
+    )
+    line = "🐍 Running code from " + ("x" * 30) + "..."
+
+    await adapter.send(session.chat_id, line)
+
+    tool = next(frame for frame in send.frames() if frame["type"] == "tool")
+    assert tool["truncated"] is True
+    assert len(transport.encode_frame(tool)) <= transport.MAX_TOOL_FRAME_BYTES
+
+
+async def test_cumulative_progress_edit_does_not_repeat_a_tool_frame(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    first_query = "heavy lift project cargo vessel voyage analysis"
+    second_query = "project cargo hold cleaning costs"
+    agent = tool_agent(
+        ("call_1", "web_search", {"query": first_query}),
+        ("call_2", "web_search", {"query": second_query}),
+    )
+    adapter.gateway_runner = FakeRunner({session.chat_id: agent})
+    first_line = '🔍 Searching the web for "heavy lift project cargo vessel voya..."'
+    second_line = '🔍 Searching the web for "project cargo hold cleaning costs"'
+
+    await adapter.send(session.chat_id, first_line)
+    await adapter.edit_message(
+        session.chat_id, "m1", first_line + "\n" + second_line
+    )
+
+    frames = send.frames()
+    tool_frames = [frame for frame in frames if frame["type"] == "tool"]
+    assert [frame["id"] for frame in tool_frames] == ["call_1", "call_2"]
+    deltas = [frame["content"] for frame in frames if frame["type"] == "delta"]
+    assert "".join(deltas) == first_line + "\n" + second_line
+
+
+async def test_duplicate_send_does_not_repeat_a_tool_frame(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: tool_agent(("call_1", "web_search", {"query": QUERY}))}
+    )
+
+    await adapter.send(session.chat_id, PROGRESS)
+    await adapter.send(session.chat_id, PROGRESS)
+
+    assert [
+        frame["id"] for frame in send.frames() if frame["type"] == "tool"
+    ] == ["call_1"]
+    assert len([frame for frame in send.frames() if frame["type"] == "delta"]) == 1
+
+
+async def test_pre_tool_call_capture_covers_stale_agent_history(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    agent = SimpleNamespace(session_id="hermes-s1")
+    adapter.gateway_runner = FakeRunner({session.chat_id: agent})
+    service.remember_tool_call(
+        "hermes-s1", "call_1", "web_search", {"query": QUERY}
+    )
+
+    await adapter.send(session.chat_id, PROGRESS)
+
+    tool = next(frame for frame in send.frames() if frame["type"] == "tool")
+    assert tool["id"] == "call_1"
+    assert tool["arguments"] == {"query": QUERY}
+    assert service.pending_tool_calls("hermes-s1") == []
+
+
+async def test_ambiguous_matches_are_skipped(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                ("call_1", "web_search", {"query": QUERY}),
+                ("call_2", "web_search", {"query": QUERY + " extended"}),
+            )
+        }
+    )
+
+    await adapter.send(session.chat_id, PROGRESS)
+
+    assert [frame["type"] for frame in send.frames()] == ["start", "delta"]
+
+
+async def test_final_answer_without_a_progress_line_sends_no_tool_frame(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: tool_agent(("call_1", "web_search", {"query": QUERY}))}
+    )
+
+    await adapter.send(
+        session.chat_id, "Here is the answer", metadata={"notify": True}
+    )
+
+    assert [frame["type"] for frame in send.frames()] == ["start", "delta", "done"]
+    assert "tool" not in [frame["type"] for frame in send.frames()]
+
+
+async def test_concurrent_sessions_announce_only_their_own_tools(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    first, first_send = make_session(tmp_path, session_id="first")
+    second, second_send = make_session(tmp_path, session_id="second")
+    for session in (first, second):
+        service.router.reset(session.chat_id)
+        await session.start()
+    adapter._server = MultiSessionServer([first, second])
+    first_query = "first heavy lift voyage analysis"
+    second_query = "second port congestion analysis"
+    adapter.gateway_runner = FakeRunner(
+        {
+            first.chat_id: tool_agent(
+                ("call_1", "web_search", {"query": first_query})
+            ),
+            second.chat_id: tool_agent(
+                ("call_2", "web_search", {"query": second_query})
+            ),
+        }
+    )
+
+    await adapter.send(
+        first.chat_id, '🔍 Searching the web for "first heavy lift voyage a..."'
+    )
+    await adapter.send(
+        second.chat_id,
+        '🔍 Searching the web for "second port congestion analy..."',
+    )
+
+    first_tool = next(f for f in first_send.frames() if f["type"] == "tool")
+    second_tool = next(f for f in second_send.frames() if f["type"] == "tool")
+    assert first_tool["arguments"] == {"query": first_query}
+    assert second_tool["arguments"] == {"query": second_query}
+
+
+async def test_malformed_send_metadata_does_not_break_delivery(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+
+    result = await adapter.send(session.chat_id, "hello", metadata="not-a-dict")
+
+    assert result.success is True
+    assert [frame["type"] for frame in send.frames()] == ["start", "delta"]
+    assert send.frames()[-1] == {"type": "delta", "content": "hello"}
+
+
+async def test_tool_frame_collection_failure_keeps_the_text_stream(
+    tmp_path, monkeypatch
+):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("unexpected history shape")
+
+    monkeypatch.setattr(gateway_adapter, "collect_tool_frames", fail)
+
+    await adapter.send(session.chat_id, PROGRESS)
+
+    assert [frame["type"] for frame in send.frames()] == ["start", "delta"]
+    assert send.frames()[-1] == {"type": "delta", "content": PROGRESS}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"token": "abc", "nested": {"client_secret": "xyz"}},
+        {"password": "p", "query": QUERY},
+        {"authorization": "Bearer abc", "command": "ls"},
+    ],
+)
+def test_bounded_arguments_redact_secret_shaped_keys(arguments):
+    bounded, _truncated = gateway_adapter._bound_tool_arguments(arguments)
+
+    encoded = json.dumps(bounded)
+    assert "[redacted]" in encoded
+    for key in ("token", "password", "authorization"):
+        if key in arguments:
+            assert bounded[key] == "[redacted]"
+    nested = bounded.get("nested")
+    if isinstance(nested, dict) and "client_secret" in nested:
+        assert nested["client_secret"] == "[redacted]"
+
+
+def test_bounded_arguments_drop_unsupported_values():
+    bounded, truncated = gateway_adapter._bound_tool_arguments(
+        {"query": QUERY, "handle": object()}
+    )
+
+    assert bounded == {"query": QUERY, "handle": "[unsupported]"}
+    assert truncated is True
+
+
+def test_bounded_arguments_omit_payload_shaped_keys():
+    bounded, truncated = gateway_adapter._bound_tool_arguments(
+        {"path": "notes.txt", "content": "secret file body", "query": QUERY}
+    )
+
+    assert bounded["path"] == "notes.txt"
+    assert bounded["query"] == QUERY
+    assert bounded["content"] == "[omitted]"
+    assert truncated is True
+
+
+def test_bounded_arguments_redact_inline_secret_values():
+    bounded, truncated = gateway_adapter._bound_tool_arguments(
+        {"query": "look up api_key=sk-live-1234567890 and report"}
+    )
+
+    encoded = json.dumps(bounded)
+    assert "sk-live-1234567890" not in encoded
+    assert "[redacted]" in encoded
+    assert truncated is True
+
+
+# --------------------------------------------------------------------------- #
 # Adapter connect / disconnect
 # --------------------------------------------------------------------------- #
 
@@ -2032,6 +2397,7 @@ class FakeContext:
     def __init__(self) -> None:
         self.platforms: list[dict] = []
         self.commands: list[dict] = []
+        self.hooks: list[tuple[str, object]] = []
 
     def register_platform(self, **kwargs) -> None:
         _FAKE_PLATFORM_NAMES.add(kwargs["name"])
@@ -2039,6 +2405,9 @@ class FakeContext:
 
     def register_command(self, **kwargs) -> None:
         self.commands.append(kwargs)
+
+    def register_hook(self, name, callback) -> None:
+        self.hooks.append((name, callback))
 
 
 @pytest.fixture
@@ -2126,6 +2495,26 @@ def test_register_records_one_platform(fake_hermes):
     assert callable(registration["validate_config"])
     assert registration["max_message_length"] == 0
     assert "platform_hint" in registration
+    gateway_adapter.ChannelService.reset()
+
+
+def test_register_captures_full_tool_args_for_later_progress(fake_hermes):
+    ctx = FakeContext()
+    gateway_adapter.register(ctx)
+    hooks = [item for item in ctx.hooks if item[0] == "pre_tool_call"]
+    assert len(hooks) == 1
+
+    hooks[0][1](
+        tool_name="web_search",
+        args={"query": QUERY, "api_key": "sk-secret"},
+        session_id="hermes-s1",
+        tool_call_id="call_1",
+    )
+
+    pending = gateway_adapter.ChannelService.get().pending_tool_calls("hermes-s1")
+    assert pending[0]["id"] == "call_1"
+    assert pending[0]["name"] == "web_search"
+    assert pending[0]["arguments"]["query"] == QUERY
     gateway_adapter.ChannelService.reset()
 
 

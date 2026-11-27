@@ -246,6 +246,73 @@ async def test_streamed_turn_end_to_end(tmp_path):
         await client_endpoint.close()
 
 
+async def test_tool_frame_end_to_end(tmp_path):
+    query = "heavy lift project cargo vessel voyage analysis"
+    progress = '🔍 Searching the web for "heavy lift project cargo vessel voya..."'
+    server, client_endpoint, adapter, service, _client_id = await build_stack(
+        tmp_path
+    )
+    agent = type(
+        "Agent",
+        (),
+        {
+            "_session_messages": [
+                {"role": "user", "content": "research heavy lift"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": json.dumps({"query": query}),
+                            },
+                        }
+                    ],
+                },
+            ]
+        },
+    )()
+
+    class Runner:
+        def _session_key_for_source(self, source):
+            return source.chat_id
+
+        def _resident_agent_for(self, key):
+            return agent
+
+    class Responder:
+        async def __call__(self, event):
+            chat_id = event.source.chat_id
+            await adapter.send(chat_id, progress)
+            await adapter.send(
+                chat_id, "Here is the answer", metadata={"notify": True}
+            )
+
+    adapter.gateway_runner = Runner()
+    adapter.handle_message = Responder()
+    client = None
+    try:
+        await server.start()
+        client = await Client.dial(client_endpoint, addr_of(server))
+        await client.send_prompt("research heavy lift", session_id="tool-1")
+        frames = await client.until_terminal()
+
+        types = [frame["type"] for frame in frames]
+        assert types == ["start", "tool", "delta", "delta", "done"]
+        assert types.count("done") == 1
+        tool = frames[1]
+        assert tool["name"] == "web_search"
+        assert tool["arguments"] == {"query": query}
+        deltas = [frame["content"] for frame in frames if frame["type"] == "delta"]
+        assert "".join(deltas) == progress + "\n\nHere is the answer"
+    finally:
+        if client:
+            await client.close()
+        await server.stop()
+        await client_endpoint.close()
+
+
 async def test_non_streamed_turn_end_to_end(tmp_path):
     reply = "A single complete reply."
     server, client_endpoint, adapter, service, _client_id = await build_stack(

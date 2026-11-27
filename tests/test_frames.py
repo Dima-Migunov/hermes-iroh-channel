@@ -87,6 +87,47 @@ def test_done_frame_drops_metadata_over_the_size_bound():
     assert transport.done_frame(metadata) == {"type": "done"}
 
 
+def test_tool_frame_exact_bytes():
+    frame = transport.tool_frame("call_1", "web_search", {"query": "q"})
+
+    assert frame == {
+        "type": "tool",
+        "id": "call_1",
+        "name": "web_search",
+        "arguments": {"query": "q"},
+    }
+    assert transport.encode_frame(frame) == (
+        b'{"type":"tool","id":"call_1","name":"web_search",'
+        b'"arguments":{"query":"q"}}\n'
+    )
+
+
+def test_tool_frame_omits_an_empty_id_and_marks_truncation():
+    frame = transport.tool_frame("", "terminal", {"command": "ls"}, truncated=True)
+
+    assert frame == {
+        "type": "tool",
+        "name": "terminal",
+        "arguments": {"command": "ls"},
+        "truncated": True,
+    }
+    assert "id" not in frame
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [None, [], "text", 1, {"blob": object()}, {"nan": float("nan")}],
+)
+def test_tool_frame_rejects_non_object_or_unencodable_arguments(arguments):
+    assert transport.tool_frame("call_1", "tool", arguments) is None
+
+
+def test_tool_frame_rejects_an_oversized_payload():
+    arguments = {"blob": "x" * transport.MAX_TOOL_FRAME_BYTES}
+
+    assert transport.tool_frame("call_1", "tool", arguments) is None
+
+
 def test_error_constants_are_stable():
     assert transport.ERR_INVALID_PROMPT == "invalid_prompt"
     assert transport.ERR_PROMPT_TOO_LARGE == "prompt_too_large"
