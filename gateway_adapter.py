@@ -67,6 +67,7 @@ TOOL_ANNOUNCED_MAX = 256
 TOOL_HISTORY_MESSAGES = 12
 TOOL_PENDING_MAX = 32
 TOOL_PENDING_TTL = 300.0
+RESPONSE_TAIL_MAX_CHARS = 4096
 
 _TOOL_SECRET_KEY_PARTS = (
     "token",
@@ -143,11 +144,78 @@ _USAGE_FIELDS = (
 )
 
 
+TOOL_FRAME_DEBUG_ENV = "HERMES_IROH_DEBUG_TOOL_FRAMES"
+TOOL_FRAME_DEBUG_VALUES = frozenset({"1", "true", "yes", "on"})
+TOOL_FRAME_DEBUG_CANDIDATES_MAX = 8
+TOOL_FRAME_DEBUG_TOKEN_MAX = 128
+_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
+
+
+def _tool_frame_debug_enabled() -> bool:
+    return (
+        os.environ.get(TOOL_FRAME_DEBUG_ENV, "").strip().lower()
+        in TOOL_FRAME_DEBUG_VALUES
+    )
+
+
+def _diagnostic_token(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return "-"
+    safe = "".join(
+        character
+        if character.isprintable() and not character.isspace()
+        else "_"
+        for character in value
+    )
+    return safe[:TOOL_FRAME_DEBUG_TOKEN_MAX] or "-"
+
+
+def _diagnostic_stream(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return "-"
+    digest = hashlib.sha256(value.encode("utf-8", errors="replace"))
+    return digest.hexdigest()[:12]
+
+
+def _diagnostic_identifier(
+    value: Any, private: tuple[Any, ...] = ()
+) -> str:
+    if not isinstance(value, str) or not value:
+        return "-"
+    if any(isinstance(item, str) and item and value == item for item in private):
+        return _diagnostic_stream(value)
+    if any(pattern.search(value) for pattern in _TOOL_SECRET_VALUE_PATTERNS):
+        return _diagnostic_stream(value)
+    if len(value) > TOOL_FRAME_DEBUG_TOKEN_MAX:
+        return _diagnostic_stream(value)
+    if _DIAGNOSTIC_IDENTIFIER_RE.fullmatch(value) is None:
+        return _diagnostic_stream(value)
+    return value
+
+
+def _debug_tool_frames(event: str, **fields: Any) -> None:
+    if not _tool_frame_debug_enabled():
+        return
+    parts = [f"event={_diagnostic_token(event)}"]
+    for key, value in fields.items():
+        if isinstance(value, bool):
+            rendered = "1" if value else "0"
+        elif isinstance(value, (int, float)):
+            rendered = str(value)
+        elif isinstance(value, str):
+            rendered = _diagnostic_token(value)
+        else:
+            continue
+        parts.append(f"{key}={rendered}")
+    logger.debug("iroh tool-frames debug: %s", " ".join(parts))
+
+
 class ResponseRouter:
     """Converts cumulative Hermes content into append-only deltas."""
 
     def __init__(self) -> None:
         self._last: dict[str, str] = {}
+        self._tails: dict[str, str] = {}
         self._terminal: set[str] = set()
 
     def reset(self, chat_id: str) -> None:
@@ -155,25 +223,89 @@ class ResponseRouter:
 
     def release(self, chat_id: str) -> None:
         self._last.pop(chat_id, None)
+        self._tails.pop(chat_id, None)
         self._terminal.discard(chat_id)
 
     def is_terminal(self, chat_id: str) -> bool:
         return chat_id in self._terminal
 
-    def consume(self, chat_id: str, content: str) -> str:
+    def _drain_tail(self, chat_id: str, text: str, *, final: bool) -> str:
+        if final or len(text) > RESPONSE_TAIL_MAX_CHARS:
+            self._tails.pop(chat_id, None)
+            delta = text
+            reason = "final" if final else "tail_bound"
+        else:
+            newline = text.rfind("\n")
+            if newline < 0:
+                self._tails[chat_id] = text
+                delta = ""
+                reason = "incomplete_line"
+            else:
+                self._tails[chat_id] = text[newline + 1 :]
+                delta = text[: newline + 1]
+                reason = "newline"
+        _debug_tool_frames(
+            "router_buffer",
+            stream=_diagnostic_stream(chat_id),
+            status="flushed" if delta else "buffered",
+            reason=reason,
+            final=final,
+            input_length=len(text),
+            delta_length=len(delta),
+            tail_length=len(self._tails.get(chat_id, "")),
+        )
+        return delta
+
+    def consume(self, chat_id: str, content: str, *, final: bool = False) -> str:
         if chat_id in self._terminal:
+            _debug_tool_frames(
+                "router_buffer",
+                stream=_diagnostic_stream(chat_id),
+                status="skipped",
+                reason="terminal",
+                final=final,
+                input_length=len(content),
+                delta_length=0,
+                tail_length=0,
+            )
             return ""
         previous = self._last.get(chat_id, "")
+        tail = self._tails.get(chat_id, "")
         if content == previous:
-            return ""
-        if content.startswith(previous):
-            delta = content[len(previous) :]
+            combined = tail
+        elif content.startswith(previous):
+            combined = tail + content[len(previous) :]
         elif previous.startswith(content):
-            return ""
+            if not final:
+                _debug_tool_frames(
+                    "router_buffer",
+                    stream=_diagnostic_stream(chat_id),
+                    status="buffered",
+                    reason="shorter_snapshot",
+                    final=final,
+                    input_length=len(content),
+                    delta_length=0,
+                    tail_length=len(tail),
+                )
+                return ""
+            self._tails.pop(chat_id, None)
+            _debug_tool_frames(
+                "router_buffer",
+                stream=_diagnostic_stream(chat_id),
+                status="flushed",
+                reason="final_shorter_snapshot",
+                final=final,
+                input_length=len(content),
+                delta_length=len(tail),
+                tail_length=0,
+            )
+            return tail
         else:
-            delta = SEGMENT_SEPARATOR + content if previous else content
+            prefix = tail + SEGMENT_SEPARATOR if previous else tail
+            self._last[chat_id] = content
+            return self._drain_tail(chat_id, prefix + content, final=final)
         self._last[chat_id] = content
-        return delta
+        return self._drain_tail(chat_id, combined, final=final)
 
     def mark_terminal(self, chat_id: str) -> bool:
         if chat_id in self._terminal:
@@ -244,29 +376,104 @@ class ChannelService:
         Values are kept in memory only and never logged. Duplicate ids are
         ignored, and each session keeps a bounded, expiring queue.
         """
+        argument_type = (
+            "mapping" if isinstance(arguments, Mapping) else type(arguments).__name__
+        )
+        call_id = tool_call_id if isinstance(tool_call_id, str) else ""
+        private = (session_id,)
+        diag_call_id = _diagnostic_identifier(call_id, private)
+        diag_tool_name = _diagnostic_identifier(name, private)
         if not isinstance(session_id, str) or not session_id:
+            _debug_tool_frames(
+                "hook_capture",
+                session=_diagnostic_stream(session_id),
+                call_id=diag_call_id,
+                tool_name=diag_tool_name,
+                argument_type=argument_type,
+                status="rejected",
+                reason="invalid_session",
+            )
             return
         if not isinstance(name, str) or not name:
+            _debug_tool_frames(
+                "hook_capture",
+                session=_diagnostic_stream(session_id),
+                call_id=diag_call_id,
+                tool_name=diag_tool_name,
+                argument_type=argument_type,
+                status="rejected",
+                reason="invalid_tool_name",
+            )
             return
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except (TypeError, ValueError):
+                _debug_tool_frames(
+                    "hook_capture",
+                    session=_diagnostic_stream(session_id),
+                    call_id=diag_call_id,
+                    tool_name=diag_tool_name,
+                    argument_type=argument_type,
+                    status="rejected",
+                    reason="invalid_arguments",
+                )
+                return
         if not isinstance(arguments, Mapping):
+            _debug_tool_frames(
+                "hook_capture",
+                session=_diagnostic_stream(session_id),
+                call_id=diag_call_id,
+                tool_name=diag_tool_name,
+                argument_type=argument_type,
+                status="rejected",
+                reason="invalid_arguments",
+            )
             return
         record = {
-            "id": tool_call_id if isinstance(tool_call_id, str) else "",
+            "id": call_id,
             "name": name,
             "arguments": dict(arguments),
         }
         key = _tool_call_key(record)
         if not key:
+            _debug_tool_frames(
+                "hook_capture",
+                session=_diagnostic_stream(session_id),
+                call_id=diag_call_id,
+                tool_name=diag_tool_name,
+                argument_type=argument_type,
+                status="rejected",
+                reason="invalid_call_key",
+            )
             return
         with self._pending_lock:
             queue = self._pending_tools.setdefault(
                 session_id, deque(maxlen=TOOL_PENDING_MAX)
             )
             if any(item.get("key") == key for item in queue):
+                _debug_tool_frames(
+                    "hook_capture",
+                    session=_diagnostic_stream(session_id),
+                    call_id=diag_call_id,
+                    tool_name=diag_tool_name,
+                    argument_type=argument_type,
+                    status="rejected",
+                    reason="duplicate",
+                )
                 return
             record["key"] = key
             record["ts"] = time.monotonic()
             queue.append(record)
+        _debug_tool_frames(
+            "hook_capture",
+            session=_diagnostic_stream(session_id),
+            call_id=diag_call_id,
+            tool_name=diag_tool_name,
+            argument_type=argument_type,
+            status="accepted",
+            reason="stored",
+        )
 
     def pending_tool_calls(self, session_id: str) -> list[dict]:
         if not isinstance(session_id, str) or not session_id:
@@ -949,7 +1156,12 @@ def _redact_secret_values(text: str) -> str:
     return text
 
 
-def _bound_tool_value(value: Any, depth: int, truncated: list[bool]) -> Any:
+def _bound_tool_value(
+    value: Any,
+    depth: int,
+    truncated: list[bool],
+    preserved_omit_keys: frozenset[str] = frozenset(),
+) -> Any:
     if depth > TOOL_ARG_DEPTH_MAX:
         truncated[0] = True
         return "[truncated]"
@@ -976,13 +1188,16 @@ def _bound_tool_value(value: Any, depth: int, truncated: list[bool]) -> Any:
                 break
             name = str(key)[:128]
             normalized = name.lower().replace("-", "_")
-            if normalized in _TOOL_OMIT_KEYS:
+            preserve = depth == 0 and normalized in preserved_omit_keys
+            if normalized in _TOOL_OMIT_KEYS and not preserve:
                 result[name] = "[omitted]"
                 truncated[0] = True
             elif _is_secret_key(name):
                 result[name] = "[redacted]"
             else:
-                result[name] = _bound_tool_value(item, depth + 1, truncated)
+                result[name] = _bound_tool_value(
+                    item, depth + 1, truncated, preserved_omit_keys
+                )
         return result
     if isinstance(value, (list, tuple)):
         result_list = []
@@ -990,7 +1205,9 @@ def _bound_tool_value(value: Any, depth: int, truncated: list[bool]) -> Any:
             if index >= TOOL_ARG_ITEMS_MAX:
                 truncated[0] = True
                 break
-            result_list.append(_bound_tool_value(item, depth + 1, truncated))
+            result_list.append(
+                _bound_tool_value(item, depth + 1, truncated, preserved_omit_keys)
+            )
         return result_list
     truncated[0] = True
     return "[unsupported]"
@@ -1004,12 +1221,15 @@ def _json_size(value: Any) -> int:
     )
 
 
-def _bound_tool_arguments(arguments: Any) -> Optional[tuple[dict, bool]]:
+def _bound_tool_arguments(
+    arguments: Any, tool_name: str = ""
+) -> Optional[tuple[dict, bool]]:
     """Return ``(object, truncated)`` or None when no safe object can be built."""
     if not isinstance(arguments, Mapping):
         return None
+    preserved = frozenset({"file"}) if tool_name == "read_file" else frozenset()
     truncated = [False]
-    bounded = _bound_tool_value(arguments, 0, truncated)
+    bounded = _bound_tool_value(arguments, 0, truncated, preserved)
     if not isinstance(bounded, dict):
         return None
     for key in list(bounded):
@@ -1131,6 +1351,160 @@ def _line_matches_arguments(line: str, arguments: Mapping) -> bool:
     return False
 
 
+_FILE_TOOL_NAMES = frozenset({"read_file", "write_file"})
+_READ_PATH_KEYS = ("path", "file", "filepath", "file_path")
+_FILE_MARKER_RE = re.compile(
+    r"^\s*(?:[^\w\s]+(?:\s*[^\w\s]+)*\s*)?"
+    r"(read_file|write_file|Reading|Writing)(?![A-Za-z0-9_])"
+)
+_READ_LINE_SUFFIX_RE = re.compile(r"\s+L\d+(?:-\d+)?$")
+
+
+def _normalized_path(value: str) -> str:
+    return value.strip().replace("\\", "/")
+
+
+def _leading_file_marker(text: str) -> Optional[str]:
+    match = _FILE_MARKER_RE.match(text)
+    return match.group(1) if match is not None else None
+
+
+def _raw_file_selector(tail: str) -> Optional[str]:
+    tail = tail.strip()
+    if tail.startswith("("):
+        body = tail[1:].strip()
+        close = re.search(r"\)\s*(?:\.\.\.|…)?\s*$", body)
+        if close is not None:
+            body = body[: close.start()].strip()
+        if body.startswith("{"):
+            try:
+                decoded = json.loads(body)
+            except (TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, Mapping):
+                path = decoded.get("path")
+                if isinstance(path, str):
+                    return path
+        path_match = re.search(
+            r"\bpath\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^,}\s]+))",
+            body,
+        )
+        if path_match is not None:
+            return next(
+                (group for group in path_match.groups() if group is not None),
+                None,
+            )
+    tail = tail.lstrip(":= ")
+    if tail[:1] in ("'", '"'):
+        end = tail.find(tail[0], 1)
+        if end > 0:
+            return tail[1:end]
+    return tail or None
+
+
+def _file_selector(line: str, operation: str) -> Optional[str]:
+    text = _oneline_text(line)
+    marker_match = _FILE_MARKER_RE.match(text)
+    if marker_match is None:
+        return None
+    marker = marker_match.group(1)
+    tail = text[marker_match.end() :].strip()
+    if marker in _FILE_TOOL_NAMES:
+        return _raw_file_selector(tail)
+    label = "Reading" if operation == "read_file" else "Writing"
+    if marker != label:
+        return None
+    return tail.lstrip(": ").strip() or None
+
+
+def _clean_file_selector(selector: str, operation: str) -> tuple[str, bool]:
+    visible = selector.strip()
+    if operation == "read_file":
+        visible = _READ_LINE_SUFFIX_RE.sub("", visible).rstrip()
+    truncated = visible.endswith(("...", "…"))
+    if truncated:
+        marker_length = 1 if visible.endswith("…") else 3
+        visible = visible[:-marker_length].rstrip()
+    if operation == "read_file":
+        visible = _READ_LINE_SUFFIX_RE.sub("", visible).rstrip()
+    if len(visible) >= 2 and visible[0] == visible[-1] and visible[0] in (
+        "'",
+        '"',
+    ):
+        visible = visible[1:-1]
+    return visible, truncated
+
+
+def _file_selector_matches(
+    operation: str, arguments: Mapping, selector: str
+) -> bool:
+    visible, truncated = _clean_file_selector(selector, operation)
+    if len(visible) < TOOL_MATCH_MIN:
+        return False
+    visible = _normalized_path(visible)
+    keys = _READ_PATH_KEYS if operation == "read_file" else ("path",)
+    for key in keys:
+        value = arguments.get(key)
+        if not isinstance(value, str):
+            continue
+        path = _normalized_path(value)
+        if not path:
+            continue
+        if operation == "write_file":
+            if path.startswith(visible):
+                return True
+            continue
+        if "/" not in visible:
+            basename = path.rsplit("/", 1)[-1]
+            matches = (
+                basename.startswith(visible)
+                if truncated
+                else basename == visible
+            )
+            if matches:
+                return True
+        else:
+            matches = path.startswith(visible) if truncated else path == visible
+            if matches:
+                return True
+    return False
+
+
+def _line_matches_record(line: str, record: Mapping) -> bool:
+    name = record.get("name")
+    arguments = record.get("arguments")
+    if not isinstance(name, str) or not isinstance(arguments, Mapping):
+        return False
+    text = _oneline_text(line)
+    marker = _leading_file_marker(text)
+    if marker in _FILE_TOOL_NAMES:
+        if name != marker:
+            return False
+        selector = _file_selector(text, name)
+        return selector is not None and _file_selector_matches(
+            name, arguments, selector
+        )
+    if marker == "Writing":
+        if name != "write_file":
+            return False
+        selector = _file_selector(text, name)
+        return selector is not None and _file_selector_matches(
+            name, arguments, selector
+        )
+    if marker == "Reading":
+        if name == "read_file":
+            selector = _file_selector(text, name)
+            return selector is not None and _file_selector_matches(
+                name, arguments, selector
+            )
+        if name == "web_extract":
+            return _line_matches_arguments(line, arguments)
+        return False
+    if name in _FILE_TOOL_NAMES:
+        return False
+    return _line_matches_arguments(line, arguments)
+
+
 def _tool_call_key(record: Mapping) -> str:
     identifier = record.get("id")
     if isinstance(identifier, str) and identifier:
@@ -1172,22 +1546,48 @@ def collect_tool_frames(
     empty list and leaves the text stream untouched.
     """
     lines = _progress_lines(delta)
+    stream = _diagnostic_stream(session.chat_id)
     if not lines or adapter is None:
+        _debug_tool_frames(
+            "candidate_select",
+            stream=stream,
+            pending=0,
+            history=0,
+            records=0,
+            candidates=0,
+            matches=0,
+            reason="no_lines" if not lines else "no_adapter",
+        )
         return []
     source = _session_source(adapter, session)
     agent = _live_agent(adapter, source)
     if agent is None:
+        for _line in lines:
+            _debug_tool_frames(
+                "candidate_select",
+                stream=stream,
+                pending=0,
+                history=0,
+                records=0,
+                candidates=0,
+                matches=0,
+                reason="no_agent",
+            )
         return []
     agent_session_id = _read_field(agent, "session_id")
     if not isinstance(agent_session_id, str):
         agent_session_id = ""
+    diagnostic_private = (
+        agent_session_id,
+        session.chat_id,
+        getattr(session, "node_id", ""),
+    )
+    pending_records = service.pending_tool_calls(agent_session_id)
+    history_records = _recent_tool_calls(_agent_history(agent))
     records: list[dict] = []
     seen_keys: set[str] = set()
     seen_content: set[str] = set()
-    for record in (
-        *service.pending_tool_calls(agent_session_id),
-        *_recent_tool_calls(_agent_history(agent)),
-    ):
+    for record in (*pending_records, *history_records):
         key = _tool_call_key(record)
         content_key = _tool_call_content_key(record)
         if not key or key in seen_keys or content_key in seen_content:
@@ -1197,26 +1597,101 @@ def collect_tool_frames(
             seen_content.add(content_key)
         records.append(record)
     if not records:
+        for _line in lines:
+            _debug_tool_frames(
+                "candidate_select",
+                stream=stream,
+                pending=len(pending_records),
+                history=len(history_records),
+                records=0,
+                candidates=0,
+                matches=0,
+                reason="no_records",
+            )
         return []
     frames: list[dict] = []
     for line in lines:
-        matches: list[dict] = []
+        candidates: list[dict] = []
         for record in records:
             key = _tool_call_key(record)
             if not key or service.tool_announced(session.chat_id, key):
                 continue
-            if _line_matches_arguments(line, record["arguments"]):
-                matches.append(record)
+            candidates.append(record)
+        matches = [
+            record
+            for record in candidates
+            if _line_matches_record(line, record)
+        ]
+        announced_matches = [
+            record
+            for record in records
+            if service.tool_announced(session.chat_id, _tool_call_key(record))
+            and _line_matches_record(line, record)
+        ]
+        if not matches:
+            reason = "already_announced" if announced_matches else "no_match"
+        elif len(matches) > 1:
+            reason = "ambiguous"
+        else:
+            reason = "matched"
+        _debug_tool_frames(
+            "candidate_select",
+            stream=stream,
+            pending=len(pending_records),
+            history=len(history_records),
+            records=len(records),
+            candidates=len(candidates),
+            matches=len(matches),
+            reason=reason,
+        )
+        matched_keys = {_tool_call_key(record) for record in matches}
+        for record in candidates[:TOOL_FRAME_DEBUG_CANDIDATES_MAX]:
+            _debug_tool_frames(
+                "candidate",
+                stream=stream,
+                call_id=_diagnostic_identifier(
+                    record.get("id", ""), diagnostic_private
+                ),
+                tool_name=_diagnostic_identifier(
+                    record.get("name", ""), diagnostic_private
+                ),
+                matched=_tool_call_key(record) in matched_keys,
+            )
         if len(matches) != 1:
             continue
         record = matches[0]
         key = _tool_call_key(record)
         service.mark_tool_announced(session.chat_id, key)
         service.forget_tool_call(agent_session_id, key)
-        prepared = _bound_tool_arguments(record["arguments"])
+        prepared = _bound_tool_arguments(record["arguments"], record["name"])
         if prepared is None:
+            _debug_tool_frames(
+                "frame_prepare",
+                stream=stream,
+                call_id=_diagnostic_identifier(
+                    record["id"], diagnostic_private
+                ),
+                tool_name=_diagnostic_identifier(
+                    record["name"], diagnostic_private
+                ),
+                status="skipped",
+                reason="invalid_arguments",
+            )
             continue
         arguments, truncated = prepared
+        _debug_tool_frames(
+            "frame_prepare",
+            stream=stream,
+            call_id=_diagnostic_identifier(
+                record["id"], diagnostic_private
+            ),
+            tool_name=_diagnostic_identifier(
+                record["name"], diagnostic_private
+            ),
+            status="prepared",
+            reason="bounded",
+            truncated=truncated,
+        )
         frames.append(
             {
                 "id": str(record["id"])[:128],
@@ -1261,10 +1736,20 @@ async def deliver_message(
     ] = None,
 ) -> None:
     if session.terminal:
+        _debug_tool_frames(
+            "final_delivery",
+            stream=_diagnostic_stream(session.chat_id),
+            status="skipped",
+            reason="terminal",
+            delta_length=0,
+            frames=0,
+        )
         return
-    delta = service.router.consume(session.chat_id, content)
+    delta = service.router.consume(session.chat_id, content, final=finalize)
+    frames: Any = None
+    emitted_frames = 0
+    collection_failed = False
     if delta and tool_frames_factory is not None:
-        frames: Any = None
         try:
             frames = tool_frames_factory(session, delta)
             if inspect.isawaitable(frames):
@@ -1274,6 +1759,7 @@ async def deliver_message(
                 "iroh tool frame collection failed: %s", type(exc).__name__
             )
             frames = None
+            collection_failed = True
         for frame in frames or ():
             if not isinstance(frame, Mapping):
                 continue
@@ -1287,8 +1773,24 @@ async def deliver_message(
                 dict(arguments),
                 truncated=bool(frame.get("truncated")),
             )
+            emitted_frames += 1
     if delta:
         await session.append(delta)
+    if finalize:
+        _debug_tool_frames(
+            "final_delivery",
+            stream=_diagnostic_stream(session.chat_id),
+            status="failed" if collection_failed else "collected",
+            reason=(
+                "collection_failed"
+                if collection_failed
+                else "new_text"
+                if delta
+                else "no_new_text"
+            ),
+            delta_length=len(delta),
+            frames=emitted_frames,
+        )
     if finalize and service.router.mark_terminal(session.chat_id):
         metadata: Optional[dict] = None
         if metadata_factory is not None:
@@ -1440,7 +1942,7 @@ def build_adapter_class(
                 content,
                 finalize=finalize,
                 metadata_factory=self._response_metadata,
-                tool_frames_factory=self._tool_frames if not finalize else None,
+                tool_frames_factory=self._tool_frames,
             )
             return send_result(success=True, message_id=session.chat_id)
 

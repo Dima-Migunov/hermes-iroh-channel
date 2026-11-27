@@ -166,6 +166,38 @@ effect for the node's next stream without a restart. See
 | Clients time out while connecting under load | Pending handshake admission cap reached | Retry; raise `HERMES_IROH_MAX_PENDING_HANDSHAKES` if the host has capacity |
 | Client gets `invalid_prompt` | `session_id` failed the grammar | Use only ASCII letters, digits, `_`, `.`, `-`, at most 128 characters, without `..` |
 
+### Troubleshooting tool frames
+
+Tool-frame correlation is silent by default. To enable content-free diagnostics for
+one gateway process, prefix the normal gateway launch command with
+`HERMES_IROH_DEBUG_TOOL_FRAMES=1`:
+
+```bash
+HERMES_IROH_DEBUG_TOOL_FRAMES=1 <your-normal-gateway-launch-command>
+```
+
+Only `1`, `true`, `yes`, and `on` (case-insensitive, with surrounding whitespace
+ignored) enable it. Reproduce one turn, then inspect the gateway log for lines
+prefixed with `iroh tool-frames debug:`. The gateway logger must be at `DEBUG`
+level; otherwise these records are filtered out. Remove the variable and restart
+normally when finished.
+
+The report contains only correlation metadata: a short stream hash, record and
+candidate counts, call ids and tool names, match counts, skip reasons, and text or
+buffer lengths. For example, `event=candidate_select ... candidates=2 matches=2
+reason=ambiguous` means the visible progress matched more than one unannounced
+call. `reason=no_records` means no captured or recent call was available;
+`no_match` means candidates existed but none matched; `already_announced` means
+the matching call was already emitted; and `invalid_arguments` means a matched
+record could not be bounded into a safe frame. `router_buffer` and
+`final_delivery` events explain delayed text and final collection using lengths
+and statuses only.
+
+Diagnostics never include progress text, paths, argument keys or values, file
+contents, queries, credentials, raw Hermes session ids, chat ids, node ids, or
+client identity. They are debug for this change's correlation only and do not
+change assistant-text delivery.
+
 For a reproducible install, pin the commit:
 
 ```bash
@@ -482,6 +514,14 @@ no frame is sent and the text stream is unchanged.
   sent in line order immediately before that delta.
 - A tool call is announced at most once per response. Cumulative progress edits
   do not repeat a frame, and no `tool` frame follows `done` or `error`.
+- Frame collection also runs for the turn-final delivery. If that delivery carries
+  a new, uniquely correlatable progress line, its `tool` frame is sent before the
+  delivery's text delta and before `done`. A final answer with no new progress
+  produces no frame.
+- The Hermes `pre_tool_call` observer accepts arguments as a mapping or as a JSON
+  string that decodes to an object. Malformed JSON, arrays, scalars, and other
+  unsupported shapes are ignored without logging argument values or changing the
+  assistant-text stream.
 - The frame is display data only. `delta.content` must not be edited, reordered,
   or reconstructed from it, and the client MUST NOT execute or replay the
   arguments.
@@ -496,6 +536,21 @@ no frame is sent and the text stream is unchanged.
 - Tool frames do not consume the assistant-text response budget. A client that
   does not understand `tool` ignores it and sees exactly the same `delta` text and
   exactly one terminal frame.
+- File-tool progress is correlated by operation as well as visible path text.
+  `read_file` may show a basename, a truncated basename or path, and an optional
+  line label such as ` L20` or ` L20-35`; Hermes path aliases (`path`, `file`,
+  `filepath`, and defensively `file_path`) are recognized. `write_file` uses only
+  its `path` argument and may show a truncated path prefix. Path separators are
+  normalized for comparison without accessing the filesystem.
+- A raw `read_file` or `write_file` name restricts matching to that operation, and
+  the friendly `Writing` label means `write_file`. `Reading` is shared by
+  `read_file` and `web_extract`, so the visible selector and argument schema must
+  also match. An ellipsis never supplies or guesses hidden path characters, and
+  `write_file.content` is never searched for a progress selector.
+- A frame requires exactly one unannounced matching call in the active session.
+  Duplicate basenames, shared truncated prefixes, and untruncated partial
+  basenames remain ambiguous and produce text without a `tool` frame. Non-file
+  tools retain unambiguous argument-prefix matching.
 - Absence of a `tool` frame means "no structured data"; it never means an empty
   tool call. Some tool calls produce no progress line or no recoverable history.
 
@@ -518,6 +573,13 @@ The server never repeats text already sent in the same response. When Hermes
 starts a new text segment (for example after a tool call), the server separates
 it from the previous segment with a blank line (`\n\n`) inside the next delta.
 A segment boundary never ends the response.
+
+An unterminated trailing line is retained across cumulative deliveries so a split
+progress line can be correlated and announced before its completed text. The
+buffer is bounded; when a line exceeds that bound it is flushed without loss.
+At turn end, any remaining fragment is flushed as text without inventing a
+`tool` frame. Consequently, the final unterminated line of ordinary streamed text
+may arrive on the next newline, the safety-bound flush, or the turn-final delta.
 
 Each `delta` frame carries at most 16 KiB (16 * 1024 bytes) of UTF-8 content;
 longer text is split on character boundaries, so a client can concatenate

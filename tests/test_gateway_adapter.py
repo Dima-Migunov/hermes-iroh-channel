@@ -29,46 +29,48 @@ NODE_B = "b" * 64
 def test_prefix_extension_emits_only_the_suffix():
     router = gateway_adapter.ResponseRouter()
 
-    assert router.consume("c", "Hello") == "Hello"
-    assert router.consume("c", "Hello world") == " world"
-    assert router.consume("c", "Hello world!") == "!"
+    assert router.consume("c", "Hello", final=True) == "Hello"
+    assert router.consume("c", "Hello world", final=True) == " world"
+    assert router.consume("c", "Hello world!", final=True) == "!"
 
 
 def test_identical_content_emits_nothing():
     router = gateway_adapter.ResponseRouter()
-    router.consume("c", "same")
+    router.consume("c", "same", final=True)
 
-    assert router.consume("c", "same") == ""
+    assert router.consume("c", "same", final=True) == ""
 
 
 def test_shorter_content_emits_nothing_and_keeps_the_longer_prefix():
     router = gateway_adapter.ResponseRouter()
-    router.consume("c", "abcdef")
+    router.consume("c", "abcdef", final=True)
 
     assert router.consume("c", "abc") == ""
-    assert router.consume("c", "abcdefgh") == "gh"
+    assert router.consume("c", "abcdefgh", final=True) == "gh"
 
 
 def test_non_prefix_segment_is_separated_by_a_blank_line():
     router = gateway_adapter.ResponseRouter()
-    router.consume("c", "first segment")
+    router.consume("c", "first segment", final=True)
 
-    assert router.consume("c", "second segment") == "\n\nsecond segment"
-    assert router.consume("c", "second segment!") == "!"
+    assert router.consume("c", "second segment", final=True) == (
+        "\n\nsecond segment"
+    )
+    assert router.consume("c", "second segment!", final=True) == "!"
 
 
 def test_first_content_after_segment_has_no_separator():
     router = gateway_adapter.ResponseRouter()
 
-    assert router.consume("c", "only") == "only"
+    assert router.consume("c", "only", final=True) == "only"
 
 
 def test_chats_are_isolated():
     router = gateway_adapter.ResponseRouter()
-    router.consume("a", "alpha")
+    router.consume("a", "alpha", final=True)
 
-    assert router.consume("b", "beta") == "beta"
-    assert router.consume("a", "alphabet") == "bet"
+    assert router.consume("b", "beta", final=True) == "beta"
+    assert router.consume("a", "alphabet", final=True) == "bet"
 
 
 def test_terminal_delivery_is_deduplicated():
@@ -88,23 +90,67 @@ def test_consume_after_terminal_emits_nothing():
 
 def test_reset_clears_both_state_maps():
     router = gateway_adapter.ResponseRouter()
-    router.consume("c", "text")
+    router.consume("c", "text\n")
     router.mark_terminal("c")
 
     router.reset("c")
 
     assert router.is_terminal("c") is False
-    assert router.consume("c", "fresh") == "fresh"
+    assert router.consume("c", "fresh", final=True) == "fresh"
 
 
 def test_non_streamed_single_send_emits_full_text():
     router = gateway_adapter.ResponseRouter()
     reply = "one complete reply"
 
-    delta = router.consume("c", reply)
+    delta = router.consume("c", reply, final=True)
 
     assert delta == reply
     assert router.mark_terminal("c") is True
+
+
+def test_split_trailing_line_is_withheld_until_completed():
+    router = gateway_adapter.ResponseRouter()
+    first = '🔍 Searching the web for "heavy lift project'
+    complete = first + ' cargo vessel voyage analysis..."\n'
+
+    assert router.consume("c", first) == ""
+    assert router.consume("c", complete) == complete
+
+
+def test_final_consume_flushes_an_incomplete_line():
+    router = gateway_adapter.ResponseRouter()
+
+    assert router.consume("c", "unfinished progress") == ""
+    assert router.consume("c", "unfinished progress", final=True) == (
+        "unfinished progress"
+    )
+
+
+def test_duplicate_final_consume_does_not_repeat_text():
+    router = gateway_adapter.ResponseRouter()
+
+    assert router.consume("c", "final fragment", final=True) == "final fragment"
+    assert router.mark_terminal("c") is True
+    assert router.mark_terminal("c") is False
+    assert router.consume("c", "final fragment", final=True) == ""
+
+
+def test_non_prefix_replacement_flushes_the_old_tail_before_separator():
+    router = gateway_adapter.ResponseRouter()
+
+    assert router.consume("c", "old fragment") == ""
+    assert router.consume("c", "new fragment") == "old fragment\n\n"
+    assert router.consume("c", "new fragment", final=True) == "new fragment"
+
+
+def test_oversized_trailing_fragment_is_flushed_without_loss():
+    router = gateway_adapter.ResponseRouter()
+    oversized = "x" * 4097
+
+    assert router.consume("c", oversized) == oversized
+    assert router.consume("c", oversized + "y\n") == "y\n"
+    assert router.consume("c", oversized + "y\n", final=True) == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -690,7 +736,7 @@ def tool_agent(*calls, session_id="s1"):
 
 
 QUERY = "heavy lift project cargo vessel voyage analysis"
-PROGRESS = '🔍 Searching the web for "heavy lift project cargo vessel voya..."'
+PROGRESS = '🔍 Searching the web for "heavy lift project cargo vessel voya..."\n'
 
 
 async def test_tool_frame_carries_the_full_query_before_the_progress_delta(tmp_path):
@@ -806,13 +852,346 @@ async def test_oversized_arguments_are_bounded_and_marked_truncated(tmp_path):
             )
         }
     )
-    line = "🐍 Running code from " + ("x" * 30) + "..."
+    line = "🐍 Running code from " + ("x" * 30) + "...\n"
 
     await adapter.send(session.chat_id, line)
 
     tool = next(frame for frame in send.frames() if frame["type"] == "tool")
     assert tool["truncated"] is True
     assert len(transport.encode_frame(tool)) <= transport.MAX_TOOL_FRAME_BYTES
+
+
+async def test_read_file_basename_preview_matches_recorded_path(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    path = "/home/user/project/notes.md"
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                ("call_read", "read_file", {"path": path})
+            )
+        }
+    )
+    progress = "📖 Reading notes.md...\n"
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1] == {
+        "type": "tool",
+        "id": "call_read",
+        "name": "read_file",
+        "arguments": {"path": path},
+    }
+    assert frames[2] == {"type": "delta", "content": progress}
+
+
+@pytest.mark.parametrize("argument_key", ["file", "filepath", "file_path"])
+async def test_read_file_basename_preview_accepts_hermes_path_aliases(
+    tmp_path, argument_key
+):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    path = "/home/user/project/notes.md"
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                (
+                    "call_read",
+                    "read_file",
+                    {argument_key: path},
+                )
+            )
+        }
+    )
+
+    await adapter.send(session.chat_id, "📖 Reading notes.md...\n")
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1]["id"] == "call_read"
+    assert frames[1]["name"] == "read_file"
+    assert frames[1]["arguments"] == {argument_key: path}
+
+
+async def test_read_file_truncated_basename_preview_matches_prefix(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    path = (
+        "/home/user/project/"
+        "Справочная система для heavy-lift морская документация.md"
+    )
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                ("call_read", "read_file", {"path": path})
+            )
+        }
+    )
+    progress = "📖 Reading Справочная система для heavy-lift мор...\n"
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1]["id"] == "call_read"
+    assert frames[1]["arguments"] == {"path": path}
+    assert frames[2] == {"type": "delta", "content": progress}
+
+
+@pytest.mark.parametrize("line_label", ["L20", "L20-35"])
+async def test_read_file_basename_preview_ignores_optional_line_label(
+    tmp_path, line_label
+):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                (
+                    "call_read",
+                    "read_file",
+                    {"path": "/home/user/project/notes.md"},
+                )
+            )
+        }
+    )
+    progress = f"📖 Reading notes.md {line_label}...\n"
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1]["id"] == "call_read"
+
+
+async def test_write_file_truncated_path_preview_matches_prefix(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    path = "/home/user/Obsidian Vault/Ideas/big idea.md"
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                ("call_write", "write_file", {"path": path})
+            )
+        }
+    )
+    progress = "✍️ Writing /home/user/Obsidian Vault/Ideas/bi...\n"
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1]["id"] == "call_write"
+    assert frames[1]["arguments"] == {"path": path}
+    assert frames[2] == {"type": "delta", "content": progress}
+
+
+async def test_read_file_basename_matching_normalizes_path_separators(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                (
+                    "call_read",
+                    "read_file",
+                    {"path": r"C:\Users\me\project\notes.md"},
+                )
+            )
+        }
+    )
+
+    await adapter.send(session.chat_id, "📖 Reading notes.md...\n")
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1]["id"] == "call_read"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected_id"),
+    [("read_file", "call_read"), ("write_file", "call_write")],
+)
+async def test_raw_file_tool_name_restricts_the_matching_operation(
+    tmp_path, tool_name, expected_id
+):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    path = "/home/user/project/notes.md"
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                ("call_read", "read_file", {"path": path}),
+                ("call_write", "write_file", {"path": path}),
+            )
+        }
+    )
+    progress = f'{tool_name}(path="{path}")...\n'
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1]["id"] == expected_id
+    assert frames[1]["name"] == tool_name
+
+
+async def test_reading_label_keeps_generic_matching_for_web_extract(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    url = "https://example.com/articles/heavy-lift-planning"
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                ("call_extract", "web_extract", {"url": url})
+            )
+        }
+    )
+    progress = "📖 Reading https://example.com/articles/heavy...\n"
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1]["id"] == "call_extract"
+    assert frames[1]["name"] == "web_extract"
+    assert frames[1]["arguments"] == {"url": url}
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Reading list of heavy lift vessels",
+        "write_file incident review",
+        "read_file recovery plan",
+    ],
+)
+async def test_non_file_argument_markers_keep_generic_matching(
+    tmp_path, query
+):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: tool_agent(("call_search", "web_search", {"query": query}))}
+    )
+    progress = f'🔍 Searching the web for "{query}"\n'
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1]["id"] == "call_search"
+    assert frames[1]["arguments"] == {"query": query}
+
+
+async def test_file_tool_name_inside_path_does_not_block_a_read_match(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    path = "/home/user/project/write_file-notes.md"
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: tool_agent(("call_read", "read_file", {"path": path}))}
+    )
+    progress = "📖 Reading write_file-notes.md...\n"
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1]["id"] == "call_read"
+    assert frames[1]["arguments"] == {"path": path}
+
+
+@pytest.mark.parametrize(
+    ("path", "progress"),
+    [
+        (
+            "/home/user/out.md",
+            'write_file(path="/home/user/out.md")...\n',
+        ),
+        (
+            "/home/user/out.md",
+            'write_file({"path": "/home/user/out.md"})...\n',
+        ),
+        (
+            "/home/user/out.md",
+            "write_file(path=/home/user/out.md)...\n",
+        ),
+        (
+            "/home/user/notes (draft).md",
+            'write_file(path="/home/user/notes (draft).md")...\n',
+        ),
+    ],
+)
+async def test_raw_file_progress_accepts_common_argument_syntaxes(
+    tmp_path, path, progress
+):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: tool_agent(("call_write", "write_file", {"path": path}))}
+    )
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1]["id"] == "call_write"
+    assert frames[1]["arguments"] == {"path": path}
+
+
+async def test_split_progress_line_emits_tool_before_completed_delta(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: tool_agent(("call_1", "web_search", {"query": QUERY}))}
+    )
+    partial = '🔍 Searching the web for "heavy lift project'
+
+    await adapter.send(session.chat_id, partial)
+    assert [frame["type"] for frame in send.frames()] == ["start"]
+
+    await adapter.send(session.chat_id, PROGRESS)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1]["id"] == "call_1"
+    assert frames[1]["arguments"] == {"query": QUERY}
+    assert frames[2] == {"type": "delta", "content": PROGRESS}
+
+
+async def test_incomplete_progress_line_at_finalization_flushes_without_a_frame(
+    tmp_path,
+):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: tool_agent(("call_1", "web_search", {"query": QUERY}))}
+    )
+    partial = '🔍 Searching the web for "heavy lift project'
+
+    await adapter.send(session.chat_id, partial)
+    await adapter.send(
+        session.chat_id, partial, metadata={"notify": True}
+    )
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "delta", "done"]
+    assert frames[1] == {"type": "delta", "content": partial}
 
 
 async def test_cumulative_progress_edit_does_not_repeat_a_tool_frame(tmp_path):
@@ -831,14 +1210,14 @@ async def test_cumulative_progress_edit_does_not_repeat_a_tool_frame(tmp_path):
 
     await adapter.send(session.chat_id, first_line)
     await adapter.edit_message(
-        session.chat_id, "m1", first_line + "\n" + second_line
+        session.chat_id, "m1", first_line + "\n" + second_line + "\n"
     )
 
     frames = send.frames()
     tool_frames = [frame for frame in frames if frame["type"] == "tool"]
     assert [frame["id"] for frame in tool_frames] == ["call_1", "call_2"]
     deltas = [frame["content"] for frame in frames if frame["type"] == "delta"]
-    assert "".join(deltas) == first_line + "\n" + second_line
+    assert "".join(deltas) == first_line + "\n" + second_line + "\n"
 
 
 async def test_duplicate_send_does_not_repeat_a_tool_frame(tmp_path):
@@ -858,6 +1237,38 @@ async def test_duplicate_send_does_not_repeat_a_tool_frame(tmp_path):
     assert len([frame for frame in send.frames() if frame["type"] == "delta"]) == 1
 
 
+def test_remember_tool_call_accepts_a_json_object_string():
+    service = gateway_adapter.ChannelService()
+    arguments = {"path": "/home/user/project/notes.md", "content": "private"}
+
+    service.remember_tool_call(
+        "hermes-s1",
+        "call_json",
+        "write_file",
+        json.dumps(arguments),
+    )
+
+    pending = service.pending_tool_calls("hermes-s1")
+    assert len(pending) == 1
+    assert pending[0]["id"] == "call_json"
+    assert pending[0]["name"] == "write_file"
+    assert pending[0]["arguments"] == arguments
+
+
+def test_remember_tool_call_keeps_mapping_arguments():
+    service = gateway_adapter.ChannelService()
+    arguments = {"query": QUERY}
+
+    service.remember_tool_call(
+        "hermes-s1", "call_mapping", "web_search", arguments
+    )
+
+    pending = service.pending_tool_calls("hermes-s1")
+    assert len(pending) == 1
+    assert pending[0]["arguments"] == arguments
+    assert pending[0]["arguments"] is not arguments
+
+
 async def test_pre_tool_call_capture_covers_stale_agent_history(tmp_path):
     adapter, service = make_adapter(tmp_path)
     session, send = make_session(tmp_path)
@@ -874,6 +1285,103 @@ async def test_pre_tool_call_capture_covers_stale_agent_history(tmp_path):
     assert tool["id"] == "call_1"
     assert tool["arguments"] == {"query": QUERY}
     assert service.pending_tool_calls("hermes-s1") == []
+
+
+async def test_duplicate_read_basenames_are_ambiguous(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                ("call_one", "read_file", {"path": "/one/notes.md"}),
+                ("call_two", "read_file", {"path": "/two/notes.md"}),
+            )
+        }
+    )
+    progress = "📖 Reading notes.md...\n"
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "delta"]
+    assert frames[1] == {"type": "delta", "content": progress}
+
+
+async def test_shared_truncated_write_path_prefix_is_ambiguous(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                (
+                    "call_one",
+                    "write_file",
+                    {"path": "/home/user/Obsidian Vault/Ideas/big idea.md"},
+                ),
+                (
+                    "call_two",
+                    "write_file",
+                    {"path": "/home/user/Obsidian Vault/Ideas/bigger plan.md"},
+                ),
+            )
+        }
+    )
+    progress = "✍️ Writing /home/user/Obsidian Vault/Ideas/bi...\n"
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "delta"]
+    assert frames[1] == {"type": "delta", "content": progress}
+
+
+async def test_untruncated_partial_read_basename_does_not_match(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                ("call_read", "read_file", {"path": "/one/notes.md.backup"})
+            )
+        }
+    )
+    progress = "📖 Reading notes.md\n"
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "delta"]
+    assert frames[1] == {"type": "delta", "content": progress}
+
+
+async def test_write_file_content_cannot_supply_a_progress_selector(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                (
+                    "call_write",
+                    "write_file",
+                    {
+                        "path": "/home/user/actual.md",
+                        "content": "📖 Reading notes.md...\n",
+                    },
+                )
+            )
+        }
+    )
+    progress = "📖 Reading notes.md...\n"
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "delta"]
+    assert frames[1] == {"type": "delta", "content": progress}
 
 
 async def test_ambiguous_matches_are_skipped(tmp_path):
@@ -910,6 +1418,169 @@ async def test_final_answer_without_a_progress_line_sends_no_tool_frame(tmp_path
     assert "tool" not in [frame["type"] for frame in send.frames()]
 
 
+async def test_final_delivery_with_new_progress_emits_tool_before_delta(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: tool_agent(("call_1", "web_search", {"query": QUERY}))}
+    )
+
+    await adapter.send(
+        session.chat_id, PROGRESS, metadata={"notify": True}
+    )
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == [
+        "start",
+        "tool",
+        "delta",
+        "done",
+    ]
+    assert frames[1]["id"] == "call_1"
+    assert frames[1]["arguments"] == {"query": QUERY}
+    assert frames[2] == {"type": "delta", "content": PROGRESS}
+
+
+async def test_completed_split_progress_repeated_in_final_edit_announces_once(
+    tmp_path,
+):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: tool_agent(("call_1", "web_search", {"query": QUERY}))}
+    )
+    partial = '🔍 Searching the web for "heavy lift project'
+
+    await adapter.send(session.chat_id, partial)
+    await adapter.edit_message(session.chat_id, "m1", PROGRESS)
+    await adapter.edit_message(
+        session.chat_id, "m2", PROGRESS, finalize=True
+    )
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta", "done"]
+    assert [frame["id"] for frame in frames if frame["type"] == "tool"] == [
+        "call_1"
+    ]
+    deltas = [frame["content"] for frame in frames if frame["type"] == "delta"]
+    assert deltas == [PROGRESS]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"query":"sk-live-secret-value", broken',
+        '["sk-live-secret-value"]',
+        '"sk-live-secret-value"',
+        "null",
+        ["sk-live-secret-value"],
+        "sk-live-secret-value",
+        None,
+    ],
+)
+async def test_invalid_hook_arguments_are_ignored_without_logging_or_text_changes(
+    tmp_path, caplog, arguments
+):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: SimpleNamespace(session_id="hermes-s1")}
+    )
+    caplog.set_level(logging.DEBUG, logger="gateway_adapter")
+
+    service.remember_tool_call(
+        "hermes-s1", "call_1", "web_search", arguments
+    )
+    await adapter.send(session.chat_id, PROGRESS)
+
+    assert service.pending_tool_calls("hermes-s1") == []
+    assert [frame["type"] for frame in send.frames()] == ["start", "delta"]
+    assert send.frames()[1] == {"type": "delta", "content": PROGRESS}
+    assert "sk-live-secret-value" not in caplog.text
+    assert "hermes-s1" not in caplog.text
+
+
+async def test_end_to_end_file_progress_is_ordered_deduplicated_and_session_isolated(
+    tmp_path,
+):
+    adapter, service = make_adapter(tmp_path)
+    first, first_send = make_session(tmp_path, session_id="first")
+    second, second_send = make_session(tmp_path, session_id="second")
+    for session in (first, second):
+        service.router.reset(session.chat_id)
+        await session.start()
+    adapter._server = MultiSessionServer([first, second])
+    read_path = (
+        "/home/user/Obsidian Vault/Notes/"
+        "Справочная система для heavy-lift морская документация.md"
+    )
+    write_path = "/home/user/Obsidian Vault/Ideas/big project plan.md"
+    adapter.gateway_runner = FakeRunner(
+        {
+            first.chat_id: tool_agent(
+                ("first-read", "read_file", {"path": read_path}),
+                (
+                    "first-write",
+                    "write_file",
+                    {"path": write_path, "content": "private file body"},
+                ),
+                session_id="first-agent",
+            ),
+            second.chat_id: tool_agent(
+                ("second-read", "read_file", {"path": read_path}),
+                (
+                    "second-write",
+                    "write_file",
+                    {"path": write_path, "content": "other private body"},
+                ),
+                session_id="second-agent",
+            ),
+        }
+    )
+    read_line = "📖 Reading Справочная система для heavy-lift мор...\n"
+    write_line = "✍️ Writing /home/user/Obsidian Vault/Ideas/bi...\n"
+    partial_read = "📖 Reading Справочная система для heavy"
+    partial_write = "✍️ Writing /home/user/Obsidian Vault/Ideas/bi"
+    first_content = read_line + write_line
+
+    await adapter.send(first.chat_id, partial_read)
+    await adapter.send(second.chat_id, read_line)
+    await adapter.send(first.chat_id, read_line + partial_write)
+    await adapter.send(first.chat_id, read_line + partial_write)
+    await adapter.send(second.chat_id, read_line + partial_write)
+    await adapter.edit_message(first.chat_id, "m1", first_content)
+    await adapter.send(second.chat_id, first_content)
+    await adapter.edit_message(second.chat_id, "m2", first_content)
+    await adapter.edit_message(first.chat_id, "m1", first_content, finalize=True)
+    await adapter.edit_message(second.chat_id, "m2", first_content, finalize=True)
+
+    for send, read_id, write_id in (
+        (first_send, "first-read", "first-write"),
+        (second_send, "second-read", "second-write"),
+    ):
+        frames = send.frames()
+        assert [frame["type"] for frame in frames] == [
+            "start",
+            "tool",
+            "delta",
+            "tool",
+            "delta",
+            "done",
+        ]
+        assert frames[1]["id"] == read_id
+        assert frames[1]["arguments"] == {"path": read_path}
+        assert frames[2] == {"type": "delta", "content": read_line}
+        assert frames[3]["id"] == write_id
+        assert frames[3]["arguments"]["path"] == write_path
+        assert frames[4] == {"type": "delta", "content": write_line}
+        assert "".join(
+            frame["content"] for frame in frames if frame["type"] == "delta"
+        ) == read_line + write_line
+
+
 async def test_concurrent_sessions_announce_only_their_own_tools(tmp_path):
     adapter, service = make_adapter(tmp_path)
     first, first_send = make_session(tmp_path, session_id="first")
@@ -932,11 +1603,11 @@ async def test_concurrent_sessions_announce_only_their_own_tools(tmp_path):
     )
 
     await adapter.send(
-        first.chat_id, '🔍 Searching the web for "first heavy lift voyage a..."'
+        first.chat_id, '🔍 Searching the web for "first heavy lift voyage a..."\n'
     )
     await adapter.send(
         second.chat_id,
-        '🔍 Searching the web for "second port congestion analy..."',
+        '🔍 Searching the web for "second port congestion analy..."\n',
     )
 
     first_tool = next(f for f in first_send.frames() if f["type"] == "tool")
@@ -950,11 +1621,11 @@ async def test_malformed_send_metadata_does_not_break_delivery(tmp_path):
     session, send = make_session(tmp_path)
     await register_session(adapter, service, session)
 
-    result = await adapter.send(session.chat_id, "hello", metadata="not-a-dict")
+    result = await adapter.send(session.chat_id, "hello\n", metadata="not-a-dict")
 
     assert result.success is True
     assert [frame["type"] for frame in send.frames()] == ["start", "delta"]
-    assert send.frames()[-1] == {"type": "delta", "content": "hello"}
+    assert send.frames()[-1] == {"type": "delta", "content": "hello\n"}
 
 
 async def test_tool_frame_collection_failure_keeps_the_text_stream(
@@ -1025,6 +1696,304 @@ def test_bounded_arguments_redact_inline_secret_values():
     assert "sk-live-1234567890" not in encoded
     assert "[redacted]" in encoded
     assert truncated is True
+
+
+# --------------------------------------------------------------------------- #
+# Content-free tool correlation diagnostics
+# --------------------------------------------------------------------------- #
+
+
+TOOL_FRAME_DEBUG_PREFIX = "iroh tool-frames debug:"
+
+
+def tool_frame_debug_messages(caplog) -> str:
+    return "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith(TOOL_FRAME_DEBUG_PREFIX)
+    )
+
+
+@pytest.mark.parametrize("flag_value", [None, "", "0", "false", "no", "off"])
+def test_tool_frame_diagnostics_require_explicit_enablement(
+    monkeypatch, caplog, flag_value
+):
+    if flag_value is None:
+        monkeypatch.delenv("HERMES_IROH_DEBUG_TOOL_FRAMES", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_IROH_DEBUG_TOOL_FRAMES", flag_value)
+    service = gateway_adapter.ChannelService()
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_adapter"):
+        service.remember_tool_call(
+            "raw-hermes-session-private",
+            "call_private",
+            "web_search",
+            {"query": QUERY},
+        )
+        router = gateway_adapter.ResponseRouter()
+        assert router.consume("raw-chat-private", "partial progress") == ""
+
+    assert tool_frame_debug_messages(caplog) == ""
+
+
+async def test_enabled_tool_frame_diagnostics_are_content_free(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setenv("HERMES_IROH_DEBUG_TOOL_FRAMES", "1")
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    raw_session_id = "raw-hermes-session-private"
+    recorded_path = "/home/alice/private-vault/notes.md"
+    file_body = "top-secret-file-body"
+    credential = "sk-live-private-credential"
+    progress = "✍️ Writing /home/alice/private-vault/not...\n"
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: SimpleNamespace(session_id=raw_session_id)}
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_adapter"):
+        service.remember_tool_call(
+            raw_session_id,
+            "call_private",
+            "write_file",
+            {
+                "path": recorded_path,
+                "content": file_body,
+                "api_key": credential,
+            },
+        )
+        await adapter.send(
+            session.chat_id, progress, metadata={"notify": True}
+        )
+
+    debug = tool_frame_debug_messages(caplog)
+    for expected in (
+        "event=hook_capture",
+        "status=accepted",
+        "argument_type=mapping",
+        "call_id=call_private",
+        "tool_name=write_file",
+        "event=router_buffer",
+        "event=candidate_select",
+        "pending=1",
+        "history=0",
+        "candidates=1",
+        "matches=1",
+        "reason=matched",
+        "event=frame_prepare",
+        "status=prepared",
+        "event=final_delivery",
+        "frames=1",
+    ):
+        assert expected in debug
+    for sensitive in (
+        progress,
+        recorded_path,
+        "private-vault",
+        file_body,
+        credential,
+        "api_key",
+        "content",
+        raw_session_id,
+        session.chat_id,
+        session.node_id,
+    ):
+        assert sensitive not in debug
+    assert [frame["type"] for frame in send.frames()] == [
+        "start",
+        "tool",
+        "delta",
+        "done",
+    ]
+
+
+async def test_enabled_diagnostics_explain_ambiguous_candidates(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setenv("HERMES_IROH_DEBUG_TOOL_FRAMES", "true")
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    first_path = "/one/private/notes.md"
+    second_path = "/two/private/notes.md"
+    progress = "📖 Reading notes.md...\n"
+    adapter.gateway_runner = FakeRunner(
+        {
+            session.chat_id: tool_agent(
+                ("call_one", "read_file", {"path": first_path}),
+                ("call_two", "read_file", {"path": second_path}),
+            )
+        }
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_adapter"):
+        await adapter.send(session.chat_id, progress)
+
+    debug = tool_frame_debug_messages(caplog)
+    for expected in (
+        "event=candidate_select",
+        "pending=0",
+        "history=2",
+        "candidates=2",
+        "matches=2",
+        "reason=ambiguous",
+        "call_id=call_one",
+        "call_id=call_two",
+        "tool_name=read_file",
+    ):
+        assert expected in debug
+    for sensitive in (progress, first_path, second_path, session.chat_id):
+        assert sensitive not in debug
+    assert [frame["type"] for frame in send.frames()] == ["start", "delta"]
+
+
+async def test_enabled_diagnostics_explain_missing_records(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setenv("HERMES_IROH_DEBUG_TOOL_FRAMES", "yes")
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    raw_session_id = "raw-hermes-session-private"
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: SimpleNamespace(session_id=raw_session_id)}
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_adapter"):
+        await adapter.send(session.chat_id, PROGRESS)
+
+    debug = tool_frame_debug_messages(caplog)
+    for expected in (
+        "event=candidate_select",
+        "pending=0",
+        "history=0",
+        "candidates=0",
+        "matches=0",
+        "reason=no_records",
+    ):
+        assert expected in debug
+    for sensitive in (PROGRESS, raw_session_id, session.chat_id, session.node_id):
+        assert sensitive not in debug
+
+
+def test_enabled_diagnostics_reject_hook_values_without_logging_them(
+    monkeypatch, caplog
+):
+    monkeypatch.setenv("HERMES_IROH_DEBUG_TOOL_FRAMES", "on")
+    service = gateway_adapter.ChannelService()
+    raw_session_id = "raw-hermes-session-private"
+    malformed = '{"api_key":"sk-live-private-credential"'
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_adapter"):
+        service.remember_tool_call(
+            raw_session_id, "call_private", "web_search", malformed
+        )
+
+    debug = tool_frame_debug_messages(caplog)
+    assert "event=hook_capture" in debug
+    assert "status=rejected" in debug
+    assert "reason=invalid_arguments" in debug
+    assert "argument_type=str" in debug
+    assert malformed not in debug
+    assert "sk-live-private-credential" not in debug
+    assert "api_key" not in debug
+    assert raw_session_id not in debug
+
+
+def test_enabled_diagnostics_hash_session_bearing_call_ids(
+    monkeypatch, caplog
+):
+    monkeypatch.setenv("HERMES_IROH_DEBUG_TOOL_FRAMES", "1")
+    service = gateway_adapter.ChannelService()
+    raw_session_id = "a" * 64
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_adapter"):
+        service.remember_tool_call(
+            raw_session_id, raw_session_id, "web_search", {"query": QUERY}
+        )
+
+    debug = tool_frame_debug_messages(caplog)
+    assert "call_id=" in debug
+    assert raw_session_id not in debug
+
+
+def test_enabled_diagnostics_redact_sensitive_tool_names(monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_IROH_DEBUG_TOOL_FRAMES", "1")
+    service = gateway_adapter.ChannelService()
+    raw_session_id = "raw-hermes-session-private"
+    sensitive_name = "/home/alice/private/sk-live-private-credential"
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_adapter"):
+        service.remember_tool_call(
+            raw_session_id, "call_private", sensitive_name, {"query": QUERY}
+        )
+
+    debug = tool_frame_debug_messages(caplog)
+    assert "tool_name=" in debug
+    assert sensitive_name not in debug
+    assert "/home/alice/private" not in debug
+    assert "sk-live-private-credential" not in debug
+
+
+async def test_enabled_diagnostics_distinguish_announced_matches_from_no_match(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setenv("HERMES_IROH_DEBUG_TOOL_FRAMES", "1")
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path, session_id="first")
+    service.router.reset(session.chat_id)
+    await session.start()
+    adapter._server = MultiSessionServer([session])
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: SimpleNamespace(session_id="hermes-s1")}
+    )
+    service.remember_tool_call(
+        "hermes-s1", "call_announced", "web_search", {"query": QUERY}
+    )
+    pending = service.pending_tool_calls("hermes-s1")
+    key = gateway_adapter._tool_call_key(pending[0])
+    assert service.mark_tool_announced(session.chat_id, key) is True
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_adapter"):
+        await adapter.send(session.chat_id, PROGRESS)
+        await adapter.send(
+            session.chat_id,
+            '🔍 Searching the web for "unrelated announcement..."\n',
+        )
+
+    debug = tool_frame_debug_messages(caplog)
+    assert debug.count("reason=already_announced") == 1
+    assert debug.count("reason=no_match") == 1
+
+
+async def test_enabled_diagnostics_explain_frame_preparation_failure(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setenv("HERMES_IROH_DEBUG_TOOL_FRAMES", "1")
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: tool_agent(("call_1", "web_search", {"query": QUERY}))}
+    )
+    monkeypatch.setattr(
+        gateway_adapter,
+        "_bound_tool_arguments",
+        lambda arguments, tool_name="": None,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_adapter"):
+        await adapter.send(session.chat_id, PROGRESS)
+
+    debug = tool_frame_debug_messages(caplog)
+    assert "event=frame_prepare" in debug
+    assert "status=skipped" in debug
+    assert "reason=invalid_arguments" in debug
+    assert "call_id=call_1" in debug
+    assert QUERY not in debug
+    assert [frame["type"] for frame in send.frames()] == ["start", "delta"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1439,7 +2408,7 @@ async def test_notice_send_does_not_finalize_the_stream(tmp_path):
             break
         await asyncio.sleep(0.01)
 
-    await adapter.send(chat_id, "setup notice", metadata={"_interim_send": True})
+    await adapter.send(chat_id, "setup notice\n", metadata={"_interim_send": True})
     assert server.session_for(chat_id) is not None
 
     await adapter.send(chat_id, "answer", metadata={"notify": True})
@@ -1451,7 +2420,7 @@ async def test_notice_send_does_not_finalize_the_stream(tmp_path):
         "delta",
         "done",
     ]
-    assert send.frames()[1]["content"] == "setup notice"
+    assert send.frames()[1]["content"] == "setup notice\n"
     assert send.frames()[2]["content"] == "\n\nanswer"
     assert server._sessions == {}
 
@@ -1508,7 +2477,7 @@ async def test_unmarked_progress_send_keeps_the_stream_open(tmp_path):
     session, send = make_session(tmp_path)
     await register_session(adapter, service, session)
 
-    progress = await adapter.send(session.chat_id, "searching the web")
+    progress = await adapter.send(session.chat_id, "searching the web\n")
     assert progress.success is True
     assert [frame["type"] for frame in send.frames()] == ["start", "delta"]
     assert session.terminal is False
@@ -1525,7 +2494,7 @@ async def test_unmarked_progress_send_keeps_the_stream_open(tmp_path):
     ]
     assert "".join(
         frame["content"] for frame in send.frames() if frame["type"] == "delta"
-    ) == "searching the web\n\nthe answer"
+    ) == "searching the web\n\n\nthe answer"
     assert session.terminal is True
 
 
@@ -1538,6 +2507,8 @@ async def test_streamed_preview_and_final_edit(tmp_path):
         session.chat_id, "Hel", metadata={"expect_edits": True}
     )
     await adapter.edit_message(session.chat_id, "m1", "Hello")
+    assert [frame["type"] for frame in send.frames()] == ["start"]
+
     result = await adapter.edit_message(
         session.chat_id, "m1", "Hello world", finalize=True
     )
@@ -1545,8 +2516,6 @@ async def test_streamed_preview_and_final_edit(tmp_path):
     assert result.success is True
     assert [frame["type"] for frame in send.frames()] == [
         "start",
-        "delta",
-        "delta",
         "delta",
         "done",
     ]
