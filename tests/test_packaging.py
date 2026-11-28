@@ -8,6 +8,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "plugin.yaml"
 PLUGIN_NAME = "iroh-channel"
@@ -33,6 +35,13 @@ def test_manifest_declares_required_fields():
     assert "label: " in text
     assert "version: " in text
     assert "description: " in text
+
+
+def test_manifest_declares_present_tool():
+    text = MANIFEST.read_text(encoding="utf-8")
+
+    assert "provides_tools:" in text
+    assert "- present" in text
 
 
 def test_manifest_declares_optional_env():
@@ -115,6 +124,19 @@ def test_install_docs_name_the_terminal_helper():
         assert "scripts/enable.sh" in text, f"{name} omits the helper"
         assert "--restart" in text, f"{name} omits the restart opt-in"
         assert "does not restart" in text.lower(), f"{name} omits the default"
+
+
+@pytest.mark.parametrize("name", ["README.md", "after-install.md"])
+def test_install_docs_document_interactive_fallback(name):
+    text = (ROOT / name).read_text(encoding="utf-8").lower()
+
+    assert "register_tool" in text
+    assert "registration succeeds" in text
+    assert "present" in text
+    assert "tool progress" in text
+    assert "busy" in text
+    assert "plain-text" in text or "plain text" in text
+    assert "hint" in text
 
 
 def test_install_docs_share_the_restart_handoff():

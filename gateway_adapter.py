@@ -48,7 +48,19 @@ PLATFORM_HINT = (
     "incrementally as plain text. Markdown is rendered literally and attachments "
     "are not supported: never claim to send files or images."
 )
+INTERACTIVE_PLATFORM_HINT = (
+    "\n\nWhen you need a decision or input from the user, call `present` to render "
+    "an interactive block instead of asking in prose. End your turn after the "
+    "call; do not wait for an answer in the same turn. A prompt beginning with "
+    "`⟨answer⟩` is the user's answer to the last presented block."
+)
 SEGMENT_SEPARATOR = "\n\n"
+
+
+def _platform_hint(present_available: bool) -> str:
+    if present_available:
+        return PLATFORM_HINT + INTERACTIVE_PLATFORM_HINT
+    return PLATFORM_HINT
 
 METADATA_SCHEMA = 1
 METADATA_STRING_MAX = 256
@@ -61,6 +73,10 @@ TOOL_ARG_STRING_MAX = 2048
 TOOL_ARG_KEYS_MAX = 24
 TOOL_ARG_ITEMS_MAX = 24
 TOOL_ARG_DEPTH_MAX = 4
+TOOL_ARG_UI_STRING_MAX = 8 * 1024
+TOOL_ARG_UI_KEYS_MAX = 32
+TOOL_ARG_UI_ITEMS_MAX = 64
+TOOL_ARG_UI_DEPTH_MAX = 10
 TOOL_MATCH_PREFIX = 24
 TOOL_MATCH_MIN = 8
 TOOL_ANNOUNCED_MAX = 256
@@ -1163,8 +1179,14 @@ def _bound_tool_value(
     depth: int,
     truncated: list[bool],
     preserved_omit_keys: frozenset[str] = frozenset(),
+    *,
+    ui_mode: bool = False,
 ) -> Any:
-    if depth > TOOL_ARG_DEPTH_MAX:
+    depth_max = TOOL_ARG_UI_DEPTH_MAX if ui_mode else TOOL_ARG_DEPTH_MAX
+    string_max = TOOL_ARG_UI_STRING_MAX if ui_mode else TOOL_ARG_STRING_MAX
+    keys_max = TOOL_ARG_UI_KEYS_MAX if ui_mode else TOOL_ARG_KEYS_MAX
+    items_max = TOOL_ARG_UI_ITEMS_MAX if ui_mode else TOOL_ARG_ITEMS_MAX
+    if depth > depth_max:
         truncated[0] = True
         return "[truncated]"
     if value is None or isinstance(value, bool):
@@ -1177,7 +1199,7 @@ def _bound_tool_value(
         truncated[0] = True
         return "[unsupported]"
     if isinstance(value, str):
-        clipped = _clip_utf8(value, TOOL_ARG_STRING_MAX)
+        clipped = _clip_utf8(value, string_max)
         redacted = _redact_secret_values(clipped)
         if redacted != value:
             truncated[0] = True
@@ -1185,30 +1207,41 @@ def _bound_tool_value(
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
         for index, (key, item) in enumerate(value.items()):
-            if index >= TOOL_ARG_KEYS_MAX:
+            if index >= keys_max:
                 truncated[0] = True
                 break
             name = str(key)[:128]
             normalized = name.lower().replace("-", "_")
-            preserve = depth == 0 and normalized in preserved_omit_keys
+            preserve = ui_mode or (depth == 0 and normalized in preserved_omit_keys)
             if normalized in _TOOL_OMIT_KEYS and not preserve:
                 result[name] = "[omitted]"
                 truncated[0] = True
             elif _is_secret_key(name):
                 result[name] = "[redacted]"
+                truncated[0] = True
             else:
                 result[name] = _bound_tool_value(
-                    item, depth + 1, truncated, preserved_omit_keys
+                    item,
+                    depth + 1,
+                    truncated,
+                    preserved_omit_keys,
+                    ui_mode=ui_mode,
                 )
         return result
     if isinstance(value, (list, tuple)):
         result_list = []
         for index, item in enumerate(value):
-            if index >= TOOL_ARG_ITEMS_MAX:
+            if index >= items_max:
                 truncated[0] = True
                 break
             result_list.append(
-                _bound_tool_value(item, depth + 1, truncated, preserved_omit_keys)
+                _bound_tool_value(
+                    item,
+                    depth + 1,
+                    truncated,
+                    preserved_omit_keys,
+                    ui_mode=ui_mode,
+                )
             )
         return result_list
     truncated[0] = True
@@ -1235,8 +1268,11 @@ def _bound_tool_arguments(
     if not isinstance(arguments, Mapping):
         return None
     preserved = frozenset({"file"}) if tool_name == "read_file" else frozenset()
+    ui_mode = tool_name == "present"
     truncated = [False]
-    bounded = _bound_tool_value(arguments, 0, truncated, preserved)
+    bounded = _bound_tool_value(
+        arguments, 0, truncated, preserved, ui_mode=ui_mode
+    )
     if not isinstance(bounded, dict):
         return None
     for key in list(bounded):
@@ -1254,7 +1290,20 @@ def _bound_tool_arguments(
             return None
         if total <= TOOL_ARG_MAX_BYTES:
             break
-        bounded.popitem()
+        if (
+            ui_mode
+            and isinstance(bounded.get("content"), str)
+            and bounded["content"] != "[truncated]"
+        ):
+            bounded["content"] = "[truncated]"
+        elif (
+            ui_mode
+            and "components" in bounded
+            and bounded["components"] != "[truncated]"
+        ):
+            bounded["components"] = "[truncated]"
+        else:
+            bounded.popitem()
         truncated[0] = True
     if not bounded and arguments:
         return None
@@ -1367,6 +1416,7 @@ _FILE_MARKER_RE = re.compile(
     r"(read_file|write_file|Reading|Writing)(?![A-Za-z0-9_])"
 )
 _READ_LINE_SUFFIX_RE = re.compile(r"\s+L\d+(?:-\d+)?$")
+_PRESENT_PROGRESS_RE = re.compile(r"\bpresent(?:\.\.\.|…)(?:\s|$)")
 
 
 def _normalized_path(value: str) -> str:
@@ -1511,6 +1561,8 @@ def _line_matches_record(line: str, record: Mapping) -> bool:
         return False
     if name in _FILE_TOOL_NAMES:
         return False
+    if name == "present":
+        return _PRESENT_PROGRESS_RE.search(text) is not None
     return _line_matches_arguments(line, arguments)
 
 
@@ -2007,6 +2059,21 @@ def register(ctx: Any) -> None:
 
     service = ChannelService.get()
 
+    try:
+        from . import tools as iroh_tools
+    except ImportError:
+        import tools as iroh_tools
+
+        _tools_path = getattr(iroh_tools, "__file__", None)
+        if _tools_path is None or (
+            Path(_tools_path).resolve().parent
+            != Path(__file__).resolve().parent
+        ):
+            raise ImportError(
+                "refusing to load tools from outside the plugin directory"
+            ) from None
+    present_available = iroh_tools.register_tools(ctx)
+
     def _remember_tool_call(**kwargs: Any) -> None:
         """Observer-only ``pre_tool_call`` hook: keep full args for a later line."""
         try:
@@ -2051,7 +2118,7 @@ def register(ctx: Any) -> None:
         "adapter_factory": _adapter_factory,
         "check_fn": _check_requirements,
         "validate_config": _validate_config,
-        "platform_hint": PLATFORM_HINT,
+        "platform_hint": _platform_hint(present_available),
         "max_message_length": 0,
         "emoji": "\U0001f517",
         "install_hint": (

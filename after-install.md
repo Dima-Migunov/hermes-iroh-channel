@@ -152,6 +152,23 @@ prompt, and restart the gateway outside it. Do not `pip install iroh` into the
 environment by hand: a manual install is not part of the managed dependency set
 and is not retained when Hermes rebuilds that environment.
 
+### Interactive blocks
+
+Hermes versions that expose `ctx.register_tool` let the plugin attempt to
+register a `present` tool for structured interactive blocks. Interactive blocks
+are available only when registration succeeds. The model calls the tool when it
+needs user input and must end its turn as instructed; a prompt beginning with
+`⟨answer⟩` is forwarded unchanged.
+
+When registration is unavailable or fails — including an older context without a
+callable `register_tool` or a rejected registration — the platform still
+registers but interactive blocks are unavailable. Its hint omits `present` and
+the answer marker, so chat falls back to the existing plain-text behavior.
+
+Delivery requires Hermes tool progress. The model must end its turn as
+instructed; an immediate answer while that turn remains active may be rejected
+as busy.
+
 ### Keep the node identity across reinstalls
 
 Nothing needs configuring: `node.key` and `allowlist.json` live in the installed

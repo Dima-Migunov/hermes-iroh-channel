@@ -53,6 +53,7 @@ This repository is the plugin directory: install it with
 | `__init__.py` | Import-light entry point delegating to `gateway_adapter.register` |
 | `transport.py` | Iroh endpoint, node identity, allowlist, frame codec, stream sessions |
 | `gateway_adapter.py` | Hermes platform adapter, response router, slash commands |
+| `tools.py` | Deferred `present` tool schema, acknowledgement, and registration |
 | `after-install.md` | Post-install steps Hermes shows after the plugin is installed |
 | `tests/` | Unit and loopback integration tests |
 
@@ -528,11 +529,12 @@ no frame is sent and the text stream is unchanged.
 - The encoded frame is capped at 16 KiB (16 * 1024 bytes). Values whose key names
   indicate credentials or secrets (for example `api_key`, `token`, `password`,
   `authorization`, `client_secret`) are replaced with `"[redacted]"`, and
-  secret-shaped values embedded in longer strings are redacted too. Payload keys
-  such as `content`, `patch`, or `data` become `"[omitted]"` so file and binary
-  contents are not forwarded. Overlong strings and collections are trimmed,
-  unsupported values become `"[unsupported]"`, and the frame carries
-  `"truncated":true`.
+  secret-shaped values embedded in longer strings are redacted too. Ordinary calls
+  replace payload keys such as `content`, `patch`, or `data` with `"[omitted]"` so
+  file and binary contents are not forwarded. A `present` call keeps its component
+  text and data under the UI bounds below; only an oversized payload is trimmed.
+  Overlong strings and collections are trimmed, unsupported values become
+  `"[unsupported]"`, and the frame carries `"truncated":true`.
 - Tool frames do not consume the assistant-text response budget. A client that
   does not understand `tool` ignores it and sees exactly the same `delta` text and
   exactly one terminal frame.
@@ -560,6 +562,26 @@ as received, and store a parallel list such as
 line's index in that message. Render the stored `arguments` in the tooltip for
 that line. If a history entry predates this frame or has no matching entry, show
 the line as-is.
+
+### Interactive blocks
+
+On Hermes versions that expose `ctx.register_tool`, the plugin attempts to
+register a `present` tool in the `iroh` toolset. Interactive blocks are available
+only when registration succeeds. The tool accepts optional surrounding `content`
+and a required `components` array, acknowledges immediately, and relies on the
+model ending its turn as instructed while the client renders the block. A later
+prompt beginning with `⟨answer⟩` is forwarded unchanged as the user's answer.
+
+When registration is unavailable or fails — for example on an older Hermes
+without a callable `register_tool`, or when registration is rejected — platform
+registration still succeeds. `present` stays unavailable, the platform hint
+omits the tool name and answer marker, and chat continues with the existing
+plain-text behavior.
+
+Delivery currently follows Hermes tool-progress lines. With tool progress
+disabled, or while the original turn remains active, an immediate `⟨answer⟩` may
+not be delivered or may be rejected as busy; host-level lifecycle integration
+remains a follow-up.
 
 ### Append-only delta semantics
 

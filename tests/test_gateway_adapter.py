@@ -861,6 +861,67 @@ async def test_oversized_arguments_are_bounded_and_marked_truncated(tmp_path):
     assert len(transport.encode_frame(tool)) <= transport.MAX_TOOL_FRAME_BYTES
 
 
+async def test_present_progress_line_emits_tool_frame(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    arguments = {
+        "content": "Choose a result",
+        "components": [{"type": "button", "label": "Yes"}],
+    }
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: tool_agent(("call_present", "present", arguments))}
+    )
+    progress = "⚙️ present...\n"
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    assert frames[1] == {
+        "type": "tool",
+        "id": "call_present",
+        "name": "present",
+        "arguments": arguments,
+    }
+    assert frames[2] == {"type": "delta", "content": progress}
+
+
+async def test_oversized_present_arguments_are_truncated_without_logging_values(
+    tmp_path, caplog
+):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    private_value = "private-ui-value-that-must-never-reach-the-logs"
+    arguments = {
+        "content": "Presenting a decision",
+        "components": [
+            {"type": "text", "content": private_value * 8} for _ in range(64)
+        ],
+    }
+    adapter.gateway_runner = FakeRunner(
+        {session.chat_id: tool_agent(("call_present", "present", arguments))}
+    )
+    progress = "⚙️ present...\n"
+    caplog.set_level(logging.DEBUG, logger="gateway_adapter")
+
+    await adapter.send(session.chat_id, progress)
+
+    frames = send.frames()
+    assert [frame["type"] for frame in frames] == ["start", "tool", "delta"]
+    tool = frames[1]
+    assert tool["name"] == "present"
+    assert tool["arguments"] == {
+        "content": "Presenting a decision",
+        "components": "[truncated]",
+    }
+    assert tool["truncated"] is True
+    assert len(transport.encode_frame(tool)) <= transport.MAX_TOOL_FRAME_BYTES
+    assert frames[2] == {"type": "delta", "content": progress}
+    assert private_value not in caplog.text
+
+
 async def test_read_file_basename_preview_matches_recorded_path(tmp_path):
     adapter, service = make_adapter(tmp_path)
     session, send = make_session(tmp_path)
@@ -1734,6 +1795,15 @@ def test_bounded_arguments_redact_secret_shaped_keys(arguments):
         assert nested["client_secret"] == "[redacted]"
 
 
+def test_secret_key_redaction_marks_arguments_truncated():
+    bounded, truncated = gateway_adapter._bound_tool_arguments(
+        {"api_key": "private-value"}
+    )
+
+    assert bounded == {"api_key": "[redacted]"}
+    assert truncated is True
+
+
 def test_bounded_arguments_drop_unsupported_values():
     bounded, truncated = gateway_adapter._bound_tool_arguments(
         {"query": QUERY, "handle": object()}
@@ -1762,6 +1832,156 @@ def test_bounded_arguments_redact_inline_secret_values():
     encoded = json.dumps(bounded)
     assert "sk-live-1234567890" not in encoded
     assert "[redacted]" in encoded
+    assert truncated is True
+
+
+def test_present_arguments_keep_nested_component_payloads():
+    arguments = {
+        "content": "Choose a result",
+        "components": [
+            {
+                "type": "card",
+                "children": [
+                    {
+                        "type": "chart",
+                        "props": {
+                            "content": "Scores",
+                            "data": [{"label": "A", "value": 2}],
+                            "patch": {"series": [1, 2]},
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    bounded, truncated = gateway_adapter._bound_tool_arguments(
+        arguments, "present"
+    )
+
+    assert bounded == arguments
+    assert truncated is False
+
+
+def test_present_combined_overflow_preserves_component_tree():
+    components = [{"type": "text", "content": "component stays" * 500}]
+    arguments = {"content": "x" * 8000, "components": components}
+
+    bounded, truncated = gateway_adapter._bound_tool_arguments(
+        arguments, "present"
+    )
+
+    assert bounded["components"] == components
+    assert bounded["content"] == "[truncated]"
+    assert truncated is True
+    assert gateway_adapter._json_size(bounded) <= gateway_adapter.TOOL_ARG_MAX_BYTES
+
+
+@pytest.mark.parametrize("wrappers,truncated", [(7, False), (8, True)])
+def test_present_arguments_bound_tree_depth(wrappers, truncated):
+    node = {"content": "leaf"}
+    for _ in range(wrappers):
+        node = {"props": node}
+    arguments = {"components": [node]}
+
+    bounded, marked = gateway_adapter._bound_tool_arguments(
+        arguments, "present"
+    )
+
+    assert marked is truncated
+    if truncated:
+        assert "[truncated]" in json.dumps(bounded)
+    else:
+        assert bounded == arguments
+
+
+@pytest.mark.parametrize("length,truncated", [(8 * 1024, False), (8 * 1024 + 1, True)])
+def test_present_arguments_bound_component_strings(length, truncated):
+    text = "x" * length
+    arguments = {"components": [{"content": text}]}
+
+    bounded, marked = gateway_adapter._bound_tool_arguments(
+        arguments, "present"
+    )
+
+    result = bounded["components"][0]["content"]
+    assert marked is truncated
+    if truncated:
+        assert result == "x" * (8 * 1024) + "…"
+    else:
+        assert result == text
+
+
+@pytest.mark.parametrize("count,truncated", [(32, False), (33, True)])
+def test_present_arguments_bound_component_keys(count, truncated):
+    props = {f"field_{index}": index for index in range(count)}
+    arguments = {"components": [{"props": props}]}
+
+    bounded, marked = gateway_adapter._bound_tool_arguments(
+        arguments, "present"
+    )
+
+    result = bounded["components"][0]["props"]
+    assert marked is truncated
+    assert len(result) == min(count, 32)
+
+
+@pytest.mark.parametrize("count,truncated", [(64, False), (65, True)])
+def test_present_arguments_bound_component_items(count, truncated):
+    arguments = {
+        "components": [
+            {"type": "text", "content": "item"} for _ in range(count)
+        ]
+    }
+
+    bounded, marked = gateway_adapter._bound_tool_arguments(
+        arguments, "present"
+    )
+
+    assert marked is truncated
+    assert len(bounded["components"]) == min(count, 64)
+
+
+def test_present_arguments_enforce_total_encoded_limit():
+    arguments = {
+        "components": [
+            {"type": "text", "content": "x" * 300} for _ in range(64)
+        ]
+    }
+
+    bounded, truncated = gateway_adapter._bound_tool_arguments(
+        arguments, "present"
+    )
+
+    assert bounded == {"components": "[truncated]"}
+    assert truncated is True
+    assert gateway_adapter._json_size(bounded) <= 15 * 1024
+
+
+def test_present_arguments_redact_secret_keys_and_values():
+    secret = "sk-live-1234567890"
+    arguments = {
+        "content": "Choose",
+        "components": [
+            {
+                "type": "chart",
+                "data": [{"label": secret, "api_key": "private-key"}],
+                "patch": {"note": f"token={secret}"},
+            }
+        ],
+    }
+
+    bounded, truncated = gateway_adapter._bound_tool_arguments(
+        arguments, "present"
+    )
+
+    encoded = json.dumps(bounded)
+    assert bounded["content"] == "Choose"
+    assert bounded["components"][0]["data"][0]["label"] == "[redacted]"
+    assert bounded["components"][0]["data"][0]["api_key"] == "[redacted]"
+    assert bounded["components"][0]["patch"]["note"] == "[redacted]"
+    assert secret not in encoded
+    assert "private-key" not in encoded
     assert truncated is True
 
 
@@ -2211,6 +2431,21 @@ async def test_prompt_submission_builds_one_event_with_session_keying(tmp_path):
     assert event.source.user_id == NODE_A
     assert event.source.chat_type == "dm"
     assert event.source.user_name == NODE_A[:12]
+
+
+async def test_answer_prompt_is_forwarded_unchanged(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+    prompt = '⟨answer⟩{"component_id":"choice","value":"yes"}'
+
+    handler = gateway_adapter.build_prompt_handler(
+        service, adapter, FakeEvent
+    )
+    await handler(session, prompt)
+
+    assert len(adapter.submitted) == 1
+    assert adapter.submitted[0].text == prompt
 
 
 async def test_prompt_submission_failure_emits_internal_error(tmp_path):
@@ -3429,6 +3664,41 @@ class FakePlatform:
         self.name = name
 
 
+def test_platform_hint_without_present_keeps_base_text():
+    hint = gateway_adapter._platform_hint(False)
+
+    assert hint == gateway_adapter.PLATFORM_HINT
+    assert "present" not in hint
+    assert "⟨answer⟩" not in hint
+
+
+def test_platform_hint_with_present_describes_turn_boundary_and_answer_marker():
+    hint = gateway_adapter._platform_hint(True)
+
+    assert hint.startswith(gateway_adapter.PLATFORM_HINT)
+    assert "`present`" in hint
+    assert "end your turn" in hint.lower()
+    assert "do not wait" in hint.lower()
+    assert "⟨answer⟩" in hint
+
+
+def test_present_schema_describes_compact_component_payload():
+    import tools as iroh_tools
+
+    schema = iroh_tools.PRESENT_TOOL_SCHEMA
+    parameters = schema["parameters"]
+    description = schema["description"].lower()
+
+    assert schema["name"] == "present"
+    assert parameters["type"] == "object"
+    assert parameters["required"] == ["components"]
+    assert parameters["properties"]["content"]["type"] == "string"
+    assert parameters["properties"]["components"]["type"] == "array"
+    assert parameters["properties"]["components"]["items"] == {"type": "object"}
+    for term in ("card", "text", "table", "chart", "form", "button", "15 kib"):
+        assert term in description
+
+
 class FakeContext:
     def __init__(self) -> None:
         self.platforms: list[dict] = []
@@ -3444,6 +3714,86 @@ class FakeContext:
 
     def register_hook(self, name, callback) -> None:
         self.hooks.append((name, callback))
+
+
+class FakeToolContext(FakeContext):
+    def __init__(self, registry=None, manifest=None) -> None:
+        super().__init__()
+        self.registry = {} if registry is None else registry
+        self.manifest = object() if manifest is None else manifest
+        self.tool_registrations: list[dict] = []
+
+    def register_tool(self, **kwargs):
+        self.tool_registrations.append(kwargs)
+        existing = self.registry.get(kwargs["name"])
+        if existing is not None and existing["handler"] is not kwargs["handler"]:
+            return None
+        self.registry[kwargs["name"]] = kwargs
+        return object()
+
+
+def test_present_tool_registration_uses_iroh_toolset():
+    import tools as iroh_tools
+
+    ctx = FakeToolContext()
+
+    assert iroh_tools.register_tools(ctx) is True
+    assert len(ctx.tool_registrations) == 1
+    registration = ctx.tool_registrations[0]
+    assert registration["name"] == "present"
+    assert registration["toolset"] == "iroh"
+    assert registration["schema"] is iroh_tools.PRESENT_TOOL_SCHEMA
+    assert registration["handler"] is iroh_tools._present
+
+
+@pytest.mark.parametrize("args", [None, {}, {"components": []}])
+def test_present_handler_returns_immediate_json_acknowledgement(args):
+    import tools as iroh_tools
+
+    result = iroh_tools._present(args, unexpected=True)
+
+    assert isinstance(result, str)
+    assert json.loads(result)["ok"] is True
+
+
+def test_present_tool_registration_reuses_same_manifest():
+    import tools as iroh_tools
+
+    registry = {}
+    manifest = object()
+    deferred = FakeToolContext(registry, manifest)
+    adapter = FakeToolContext(registry, manifest)
+
+    assert iroh_tools.register_tools(deferred) is True
+    handler = registry["present"]["handler"]
+    assert iroh_tools.register_tools(adapter) is True
+
+    assert adapter.tool_registrations == []
+    assert registry["present"]["handler"] is handler
+
+
+def test_present_tool_registration_without_interface_is_unavailable(caplog):
+    import tools as iroh_tools
+
+    with caplog.at_level(logging.INFO):
+        available = iroh_tools.register_tools(FakeContext())
+
+    assert available is False
+    assert "plain-text platform hint" in caplog.text
+
+
+def test_present_tool_registration_failure_is_unavailable(caplog):
+    import tools as iroh_tools
+
+    class BrokenToolContext(FakeToolContext):
+        def register_tool(self, **kwargs):
+            raise RuntimeError("sensitive registration detail")
+
+    with caplog.at_level(logging.DEBUG):
+        available = iroh_tools.register_tools(BrokenToolContext())
+
+    assert available is False
+    assert "sensitive registration detail" not in caplog.text
 
 
 @pytest.fixture
@@ -3531,6 +3881,66 @@ def test_register_records_one_platform(fake_hermes):
     assert callable(registration["validate_config"])
     assert registration["max_message_length"] == 0
     assert "platform_hint" in registration
+    gateway_adapter.ChannelService.reset()
+
+
+def test_register_without_tool_interface_uses_base_hint(fake_hermes):
+    ctx = FakeContext()
+
+    gateway_adapter.register(ctx)
+
+    assert ctx.platforms[0]["platform_hint"] == gateway_adapter.PLATFORM_HINT
+    assert "⟨answer⟩" not in ctx.platforms[0]["platform_hint"]
+    gateway_adapter.ChannelService.reset()
+
+
+def test_register_when_tool_registration_is_rejected_uses_base_hint(fake_hermes):
+    class RejectedToolContext(FakeToolContext):
+        def register_tool(self, **kwargs):
+            self.tool_registrations.append(kwargs)
+            return None
+
+    ctx = RejectedToolContext()
+
+    gateway_adapter.register(ctx)
+
+    assert ctx.registry == {}
+    assert ctx.platforms[0]["platform_hint"] == gateway_adapter.PLATFORM_HINT
+    assert "⟨answer⟩" not in ctx.platforms[0]["platform_hint"]
+    assert {command["name"] for command in ctx.commands} == {
+        "iroh_info",
+        "iroh_allow",
+        "iroh_revoke",
+    }
+    gateway_adapter.ChannelService.reset()
+
+
+def test_register_with_tool_interface_adds_interactive_hint(fake_hermes):
+    ctx = FakeToolContext()
+
+    gateway_adapter.register(ctx)
+
+    assert ctx.registry["present"]["toolset"] == "iroh"
+    assert "present" in ctx.platforms[0]["platform_hint"]
+    assert "⟨answer⟩" in ctx.platforms[0]["platform_hint"]
+    gateway_adapter.ChannelService.reset()
+
+
+def test_register_reuses_deferred_present_tool(fake_hermes):
+    import tools as iroh_tools
+
+    registry = {}
+    manifest = object()
+    deferred = FakeToolContext(registry, manifest)
+    adapter = FakeToolContext(registry, manifest)
+    assert iroh_tools.register_tools(deferred) is True
+    handler = registry["present"]["handler"]
+
+    gateway_adapter.register(adapter)
+
+    assert adapter.tool_registrations == []
+    assert registry["present"]["handler"] is handler
+    assert "⟨answer⟩" in adapter.platforms[0]["platform_hint"]
     gateway_adapter.ChannelService.reset()
 
 
