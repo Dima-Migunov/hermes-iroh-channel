@@ -3853,10 +3853,13 @@ def test_present_schema_describes_compact_component_payload():
 
     assert schema["name"] == "present"
     assert parameters["type"] == "object"
+    assert parameters["additionalProperties"] is False
     assert parameters["required"] == ["components"]
     assert parameters["properties"]["content"]["type"] == "string"
-    assert parameters["properties"]["components"]["type"] == "array"
-    assert parameters["properties"]["components"]["items"] == {"type": "object"}
+    components = parameters["properties"]["components"]
+    assert components["type"] == "array"
+    assert components["minItems"] == 1
+    assert components["items"] != {"type": "object"}
     for term in ("card", "text", "table", "chart", "form", "button", "15 kib"):
         assert term in description
 

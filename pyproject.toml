@@ -11,6 +11,7 @@ dependencies = [
 test = [
     "pytest>=9.2",
     "pytest-asyncio>=1.5",
+    "jsonschema>=4.23",
 ]
 
 [tool.pytest.ini_options]
