@@ -2468,6 +2468,36 @@ async def test_prompt_submission_failure_emits_internal_error(tmp_path):
     assert send.closed is True
 
 
+async def test_prompt_submission_failure_flushes_buffered_partial_text(tmp_path):
+    adapter, service = make_adapter(tmp_path)
+    session, send = make_session(tmp_path)
+    await register_session(adapter, service, session)
+
+    async def partial_then_fail(event):
+        await adapter.send(
+            event.source.chat_id,
+            "partial",
+            metadata={"expect_edits": True},
+        )
+        raise RuntimeError("turn failed")
+
+    adapter.handle_message = partial_then_fail
+    handler = gateway_adapter.build_prompt_handler(service, adapter, FakeEvent)
+    await handler(session, "hello")
+
+    assert [frame["type"] for frame in send.frames()] == [
+        "start",
+        "delta",
+        "error",
+    ]
+    assert send.frames()[1] == {"type": "delta", "content": "partial"}
+    assert send.frames()[-1] == {
+        "type": "error",
+        "message": transport.ERR_INTERNAL,
+    }
+    assert send.closed is True
+
+
 async def test_turn_timeout_produces_error_frame(tmp_path):
     adapter, service = make_adapter(tmp_path)
     session, send = make_session(tmp_path)
@@ -2558,18 +2588,21 @@ async def test_session_end_callback_runs_once_after_timeout(tmp_path):
     assert server._sessions == {}
 
 
-async def test_turn_timeout_releases_router_state(tmp_path, monkeypatch):
+async def test_turn_timeout_flushes_and_releases_router_state(tmp_path, monkeypatch):
     service = make_service(tmp_path)
     service.allowlist = allow_node_allowlist(tmp_path)
     adapter_class = gateway_adapter.build_adapter_class(
         service, FakeAdapterBase, "iroh", FakeSendResult, FakeEvent
     )
     adapter = adapter_class(None)
-    chat_id = transport.make_chat_id(NODE_A, "default")
     invoked = asyncio.Event()
 
     async def partial_then_hang(event):
-        service.router.consume(chat_id, "partial answer")
+        await adapter.send(
+            event.source.chat_id,
+            "partial answer",
+            metadata={"expect_edits": True},
+        )
         invoked.set()
         await asyncio.Event().wait()
 
@@ -2580,6 +2613,7 @@ async def test_turn_timeout_releases_router_state(tmp_path, monkeypatch):
 
     monkeypatch.setattr(transport.ChannelServer, "start", fake_start)
     server = await service.start()
+    adapter._server = server
     server.set_prompt_handler(
         gateway_adapter.build_prompt_handler(service, adapter, FakeEvent)
     )
@@ -2603,7 +2637,135 @@ async def test_turn_timeout_releases_router_state(tmp_path, monkeypatch):
     await server._serve_stream(FakeBi(send), NODE_A)
 
     assert invoked.is_set()
+    assert [frame["type"] for frame in send.frames()] == [
+        "start",
+        "delta",
+        "error",
+    ]
+    assert send.frames()[1] == {"type": "delta", "content": "partial answer"}
+    assert send.frames()[-1] == {
+        "type": "error",
+        "message": transport.ERR_TIMEOUT,
+    }
     assert service.router._last == {}
+    assert server._sessions == {}
+
+
+async def test_timeout_waits_for_in_progress_failure_terminal(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+    send = FakeSend()
+    sessions: list[transport.StreamSession] = []
+    flushing = asyncio.Event()
+    release_flush = asyncio.Event()
+    timeout_entered = asyncio.Event()
+    original_fail = transport.StreamSession.fail
+
+    async def observed_fail(session, message):
+        if message == transport.ERR_TIMEOUT:
+            timeout_entered.set()
+        await original_fail(session, message)
+
+    monkeypatch.setattr(transport.StreamSession, "fail", observed_fail)
+
+    async def fail_internally(session, _text):
+        sessions.append(session)
+
+        async def before_fail(_message):
+            flushing.set()
+            await release_flush.wait()
+            return "tail"
+
+        session.before_fail = before_fail
+        await session.fail(transport.ERR_INTERNAL)
+
+    server = transport.ChannelServer(
+        key_store=service.key_store,
+        allowlist=allow_node_allowlist(tmp_path),
+        turn_timeout=0.01,
+        prompt_handler=fail_internally,
+    )
+
+    class FakeRecv:
+        async def read(self, size_limit):
+            return b'{"type":"prompt","session_id":"default","text":"hi"}\n'
+
+    class FakeBi:
+        def recv(self):
+            return FakeRecv()
+
+        def send(self):
+            return send
+
+    serving = asyncio.create_task(server._serve_stream(FakeBi(), NODE_A))
+    await asyncio.wait_for(flushing.wait(), timeout=1)
+    await asyncio.wait_for(timeout_entered.wait(), timeout=1)
+    release_flush.set()
+    await asyncio.wait_for(serving, timeout=1)
+
+    assert send.frames() == [
+        {"type": "start", "session_id": "default"},
+        {"type": "delta", "content": "tail"},
+        {"type": "error", "message": transport.ERR_INTERNAL},
+    ]
+    assert send.closed is True
+    assert sessions[0].terminal is True
+    assert sessions[0].cancelled is False
+    assert server._sessions == {}
+
+
+async def test_timeout_waits_for_in_progress_error_write(tmp_path):
+    class BlockingErrorSend(FakeSend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.error_started = asyncio.Event()
+            self.release_error = asyncio.Event()
+
+        async def write_all(self, data: bytes) -> None:
+            if json.loads(data.decode("utf-8"))["type"] == "error":
+                self.error_started.set()
+                await self.release_error.wait()
+            await super().write_all(data)
+
+    send = BlockingErrorSend()
+    sessions: list[transport.StreamSession] = []
+
+    async def fail_internally(session, _text):
+        sessions.append(session)
+        await session.fail(transport.ERR_INTERNAL)
+
+    server = transport.ChannelServer(
+        key_store=make_service(tmp_path).key_store,
+        allowlist=allow_node_allowlist(tmp_path),
+        turn_timeout=0.01,
+        prompt_handler=fail_internally,
+    )
+
+    class FakeRecv:
+        async def read(self, size_limit):
+            return b'{"type":"prompt","session_id":"default","text":"hi"}\n'
+
+    class FakeBi:
+        def recv(self):
+            return FakeRecv()
+
+        def send(self):
+            return send
+
+    serving = asyncio.create_task(server._serve_stream(FakeBi(), NODE_A))
+    await asyncio.wait_for(send.error_started.wait(), timeout=1)
+    await asyncio.sleep(0.05)
+    assert not serving.done()
+
+    send.release_error.set()
+    await asyncio.wait_for(serving, timeout=1)
+
+    assert send.frames() == [
+        {"type": "start", "session_id": "default"},
+        {"type": "error", "message": transport.ERR_INTERNAL},
+    ]
+    assert send.closed is True
+    assert sessions[0].terminal is True
+    assert sessions[0].cancelled is False
     assert server._sessions == {}
 
 
@@ -3911,6 +4073,9 @@ def test_register_when_tool_registration_is_rejected_uses_base_hint(fake_hermes)
         "iroh_info",
         "iroh_allow",
         "iroh_revoke",
+        "iroh-info",
+        "iroh-allow",
+        "iroh-revoke",
     }
     gateway_adapter.ChannelService.reset()
 
@@ -4006,10 +4171,29 @@ def test_register_registers_all_commands(fake_hermes):
     gateway_adapter.register(ctx)
 
     names = {command["name"] for command in ctx.commands}
-    assert names == {"iroh_info", "iroh_allow", "iroh_revoke"}
+    assert names == {
+        "iroh_info",
+        "iroh_allow",
+        "iroh_revoke",
+        "iroh-info",
+        "iroh-allow",
+        "iroh-revoke",
+    }
     for command in ctx.commands:
         assert callable(command["handler"])
         assert command["description"]
+    gateway_adapter.ChannelService.reset()
+
+
+def test_register_registers_messaging_command_aliases(fake_hermes):
+    ctx = FakeContext()
+
+    gateway_adapter.register(ctx)
+
+    handlers = {command["name"]: command["handler"] for command in ctx.commands}
+    for documented_name in ("iroh_info", "iroh_allow", "iroh_revoke"):
+        messaging_name = documented_name.replace("_", "-")
+        assert handlers[messaging_name] is handlers[documented_name]
     gateway_adapter.ChannelService.reset()
 
 

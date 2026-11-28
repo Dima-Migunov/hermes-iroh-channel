@@ -44,6 +44,12 @@ def test_manifest_declares_present_tool():
     assert "- present" in text
 
 
+def test_manifest_declares_pre_tool_call_hook():
+    text = MANIFEST.read_text(encoding="utf-8")
+
+    assert "provides_hooks:\n  - pre_tool_call\n" in text
+
+
 def test_manifest_declares_optional_env():
     names = declared_env_names()
 

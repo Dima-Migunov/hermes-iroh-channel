@@ -272,6 +272,9 @@ class ResponseRouter:
         )
         return delta
 
+    def flush(self, chat_id: str) -> str:
+        return self.consume(chat_id, "", final=True)
+
     def consume(self, chat_id: str, content: str, *, final: bool = False) -> str:
         if chat_id in self._terminal:
             _debug_tool_frames(
@@ -1882,6 +1885,13 @@ def build_prompt_handler(
         event = event_factory(text=text, source=source)
         service.router.reset(session.chat_id)
         service.reset_tool_tracking(session.chat_id)
+
+        async def _flush_before_fail(message: str) -> str | None:
+            if message not in (transport.ERR_INTERNAL, transport.ERR_TIMEOUT):
+                return None
+            return service.router.flush(session.chat_id)
+
+        session.before_fail = _flush_before_fail
         try:
             await adapter.handle_message(event)
         except Exception:
@@ -2147,18 +2157,32 @@ def register(ctx: Any) -> None:
 
         return _handler
 
-    ctx.register_command(
+    def _register_command(name: str, handler: Any, description: str) -> None:
+        command_handler = _command_handler(handler)
+        ctx.register_command(
+            name=name,
+            handler=command_handler,
+            description=description,
+        )
+        # Hermes messaging normalizes underscores to hyphens; CLI lookup is exact.
+        ctx.register_command(
+            name=name.replace("_", "-"),
+            handler=command_handler,
+            description=description,
+        )
+
+    _register_command(
         name="iroh_info",
-        handler=_command_handler(handle_info),
+        handler=handle_info,
         description="Show the Iroh node id, ticket, relay mode, and allowlist size",
     )
-    ctx.register_command(
+    _register_command(
         name="iroh_allow",
-        handler=_command_handler(handle_allow),
+        handler=handle_allow,
         description="Authorize a client node id: /iroh_allow <client_node_id>",
     )
-    ctx.register_command(
+    _register_command(
         name="iroh_revoke",
-        handler=_command_handler(handle_revoke),
+        handler=handle_revoke,
         description="Revoke a client node id: /iroh_revoke <client_node_id>",
     )

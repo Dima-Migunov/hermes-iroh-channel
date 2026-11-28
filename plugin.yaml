@@ -3,6 +3,8 @@ label: Iroh Channel
 kind: platform
 provides_tools:
   - present
+provides_hooks:
+  - pre_tool_call
 version: 1.5.0
 description: >
   Peer-to-peer Iroh channel for Hermes Agent. Clients dial the node by ticket and

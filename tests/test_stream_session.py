@@ -322,6 +322,227 @@ async def test_error_terminal_carries_no_metadata():
     assert "metadata" not in send.frames()[-1]
 
 
+async def test_failure_reserves_terminal_before_async_flush():
+    session, send = make_session()
+    flushing = asyncio.Event()
+    release = asyncio.Event()
+
+    async def before_fail(message):
+        flushing.set()
+        await release.wait()
+        return "tail"
+
+    session.before_fail = before_fail
+    await session.start()
+    failure = asyncio.create_task(session.fail(transport.ERR_TIMEOUT))
+    await flushing.wait()
+
+    finishing = asyncio.create_task(session.finish())
+    await session.append("ignored")
+    await asyncio.sleep(0)
+    assert not finishing.done()
+    release.set()
+    await failure
+    await finishing
+
+    assert send.frames() == [
+        {"type": "start", "session_id": "default"},
+        {"type": "delta", "content": "tail"},
+        {"type": "error", "message": transport.ERR_TIMEOUT},
+    ]
+    assert send.closed is True
+
+
+async def test_concurrent_failure_takes_over_after_owner_cancellation():
+    session, send = make_session()
+    flushing = asyncio.Event()
+    release = asyncio.Event()
+
+    async def before_fail(_message):
+        flushing.set()
+        await release.wait()
+        return "tail"
+
+    session.before_fail = before_fail
+    await session.start()
+    owner = asyncio.create_task(session.fail(transport.ERR_INTERNAL))
+    await flushing.wait()
+    waiter = asyncio.create_task(session.fail(transport.ERR_TIMEOUT))
+    await asyncio.sleep(0)
+
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    release.set()
+    await waiter
+
+    assert send.frames() == [
+        {"type": "start", "session_id": "default"},
+        {"type": "delta", "content": "tail"},
+        {"type": "error", "message": transport.ERR_TIMEOUT},
+    ]
+    assert send.closed is True
+    assert session.terminal is True
+
+
+@pytest.mark.parametrize("terminal_type", ["done", "error"])
+async def test_terminal_write_cancellation_blocks_takeover(terminal_type):
+    class BlockingTerminalSend(FakeSend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminal_started = asyncio.Event()
+            self.release_terminal = asyncio.Event()
+            self.blocked = False
+
+        async def write_all(self, data: bytes) -> None:
+            frame = json.loads(data.decode("utf-8"))
+            await super().write_all(data)
+            if frame["type"] == terminal_type and not self.blocked:
+                self.blocked = True
+                self.terminal_started.set()
+                await self.release_terminal.wait()
+
+    send = BlockingTerminalSend()
+    session, _send = make_session(send)
+    await session.start()
+    if terminal_type == "done":
+        owner = asyncio.create_task(session.finish())
+    else:
+        owner = asyncio.create_task(session.fail(transport.ERR_INTERNAL))
+    await send.terminal_started.wait()
+    waiter = asyncio.create_task(session.fail(transport.ERR_TIMEOUT))
+    await asyncio.sleep(0)
+
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    await asyncio.wait_for(waiter, timeout=1)
+
+    assert [frame["type"] for frame in send.frames()] == ["start", terminal_type]
+    assert session.cancelled is True
+    assert session.terminal is False
+    assert session.finished.is_set()
+
+
+async def test_failure_flush_waits_for_in_progress_append():
+    class BlockingDeltaSend(FakeSend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delta_started = asyncio.Event()
+            self.release_delta = asyncio.Event()
+            self.blocked = False
+
+        async def write_all(self, data: bytes) -> None:
+            if not self.blocked and len(self.chunks) == 1:
+                self.blocked = True
+                self.delta_started.set()
+                await self.release_delta.wait()
+            await super().write_all(data)
+
+    send = BlockingDeltaSend()
+    session = transport.StreamSession(
+        send,
+        node_id="n" * 64,
+        session_id="default",
+        chat_id="chat",
+        max_delta_bytes=2,
+    )
+    flushing = asyncio.Event()
+
+    async def before_fail(message):
+        flushing.set()
+        return "tail"
+
+    session.before_fail = before_fail
+    await session.start()
+    append_task = asyncio.create_task(session.append("abcdef"))
+    await send.delta_started.wait()
+    failure_task = asyncio.create_task(session.fail(transport.ERR_TIMEOUT))
+    await flushing.wait()
+    send.release_delta.set()
+    await append_task
+    await failure_task
+
+    assert send.frames() == [
+        {"type": "start", "session_id": "default"},
+        {"type": "delta", "content": "ab"},
+        {"type": "delta", "content": "ta"},
+        {"type": "delta", "content": "il"},
+        {"type": "error", "message": transport.ERR_TIMEOUT},
+    ]
+    assert session.bytes_sent == 6
+
+
+async def test_failure_flush_budget_accounts_in_progress_append():
+    class BlockingDeltaSend(FakeSend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delta_started = asyncio.Event()
+            self.release_delta = asyncio.Event()
+            self.blocked = False
+
+        async def write_all(self, data: bytes) -> None:
+            if not self.blocked and len(self.chunks) == 1:
+                self.blocked = True
+                self.delta_started.set()
+                await self.release_delta.wait()
+            await super().write_all(data)
+
+    send = BlockingDeltaSend()
+    session = transport.StreamSession(
+        send,
+        node_id="n" * 64,
+        session_id="default",
+        chat_id="chat",
+        max_delta_bytes=2,
+        max_response_bytes=3,
+    )
+    flushing = asyncio.Event()
+
+    async def before_fail(message):
+        flushing.set()
+        return "cd"
+
+    session.before_fail = before_fail
+    await session.start()
+    append_task = asyncio.create_task(session.append("ab"))
+    await send.delta_started.wait()
+    failure_task = asyncio.create_task(session.fail(transport.ERR_TIMEOUT))
+    await flushing.wait()
+    send.release_delta.set()
+    await append_task
+    await failure_task
+
+    assert send.frames() == [
+        {"type": "start", "session_id": "default"},
+        {"type": "delta", "content": "ab"},
+        {"type": "error", "message": transport.ERR_RESPONSE_TOO_LARGE},
+    ]
+    assert session.bytes_sent == 2
+
+
+async def test_response_cap_during_pre_fail_flush_sends_one_error():
+    session, send = make_session(max_delta_bytes=2, max_response_bytes=3)
+
+    async def before_fail(message):
+        return "bcde"
+
+    session.before_fail = before_fail
+    await session.start()
+    await session.append("a")
+
+    await session.fail(transport.ERR_INTERNAL)
+
+    assert send.frames() == [
+        {"type": "start", "session_id": "default"},
+        {"type": "delta", "content": "a"},
+        {"type": "delta", "content": "bc"},
+        {"type": "error", "message": transport.ERR_RESPONSE_TOO_LARGE},
+    ]
+    assert send.closed is True
+    assert session.bytes_sent == 3
+
+
 async def test_metadata_does_not_consume_the_response_budget():
     session, send = make_session(max_response_bytes=5)
     await session.start()

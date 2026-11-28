@@ -927,6 +927,10 @@ class StreamSession:
         self.finished = asyncio.Event()
         self.started = False
         self.terminal = False
+        self._terminal_pending = False
+        self._terminal_done = asyncio.Event()
+        self._terminal_done.set()
+        self._write_lock = asyncio.Lock()
         self.slash_prompt = False
         self.cancelled = False
         self.deltas_sent = 0
@@ -934,9 +938,16 @@ class StreamSession:
         self.bytes_sent = 0
         self.tool_bytes_sent = 0
         self.started_monotonic = time.monotonic()
+        self.before_fail: Optional[
+            Callable[[str], Awaitable[Optional[str]]]
+        ] = None
 
     def _can_write(self) -> bool:
-        return not self.terminal and not self.cancelled
+        return (
+            not self.terminal
+            and not self.cancelled
+            and not self._terminal_pending
+        )
 
     async def start(self) -> None:
         if self.started or not self._can_write():
@@ -947,25 +958,36 @@ class StreamSession:
     async def append(self, text: str) -> None:
         if not self._can_write() or not text:
             return
+        if not await self._write_deltas(text):
+            await self.fail(ERR_RESPONSE_TOO_LARGE)
+
+    async def _write_deltas(
+        self, text: str, *, during_terminal: bool = False
+    ) -> bool:
         for chunk in chunk_text(text, self.max_delta_bytes):
-            if not self._can_write():
-                return
             size = len(chunk.encode("utf-8"))
-            if self.bytes_sent + size > self.max_response_bytes:
-                logger.info(
-                    "iroh audit: prompt rejected reason=%s node_id=%s "
-                    "session_id=%s bytes=%d limit=%d",
-                    ERR_RESPONSE_TOO_LARGE,
-                    self.node_id,
-                    self.session_id,
-                    self.bytes_sent + size,
-                    self.max_response_bytes,
-                )
-                await self.fail(ERR_RESPONSE_TOO_LARGE)
-                return
-            await self._write(delta_frame(chunk))
-            self.deltas_sent += 1
-            self.bytes_sent += size
+            async with self._write_lock:
+                if self.cancelled or self.terminal or (
+                    self._terminal_pending and not during_terminal
+                ):
+                    return True
+                if self.bytes_sent + size > self.max_response_bytes:
+                    logger.info(
+                        "iroh audit: prompt rejected reason=%s node_id=%s "
+                        "session_id=%s bytes=%d limit=%d",
+                        ERR_RESPONSE_TOO_LARGE,
+                        self.node_id,
+                        self.session_id,
+                        self.bytes_sent + size,
+                        self.max_response_bytes,
+                    )
+                    return False
+                await self._write_locked(delta_frame(chunk))
+                if self.cancelled or self.terminal:
+                    return True
+                self.deltas_sent += 1
+                self.bytes_sent += size
+        return True
 
     async def emit_tool(
         self,
@@ -995,20 +1017,56 @@ class StreamSession:
         return True
 
     async def finish(self, metadata: Optional[dict] = None) -> None:
+        while self._terminal_pending:
+            if self.terminal or self.cancelled:
+                return
+            await self._terminal_done.wait()
         if not self._can_write():
             return
-        self.terminal = True
-        await self._write(done_frame(metadata), terminal=True)
-        await self._close_send()
-        self.finished.set()
+        self._terminal_pending = True
+        self._terminal_done.clear()
+        try:
+            await self._write(done_frame(metadata), terminal=True)
+            if self.cancelled:
+                return
+            self.terminal = True
+            await self._close_send()
+            self.finished.set()
+        finally:
+            self._terminal_pending = False
+            self._terminal_done.set()
 
     async def fail(self, message: str) -> None:
+        while self._terminal_pending:
+            if self.terminal or self.cancelled:
+                return
+            await self._terminal_done.wait()
         if not self._can_write():
             return
-        self.terminal = True
-        await self._write(error_frame(message), terminal=True)
-        await self._close_send()
-        self.finished.set()
+        self._terminal_pending = True
+        self._terminal_done.clear()
+        try:
+            tail = None
+            if self.before_fail is not None:
+                try:
+                    tail = await self.before_fail(message)
+                except Exception as exc:
+                    logger.debug("iroh pre-fail flush failed: %s", type(exc).__name__)
+            if self.cancelled:
+                return
+            if tail and not await self._write_deltas(tail, during_terminal=True):
+                message = ERR_RESPONSE_TOO_LARGE
+            if self.cancelled:
+                return
+            await self._write(error_frame(message), terminal=True)
+            if self.cancelled:
+                return
+            self.terminal = True
+            await self._close_send()
+            self.finished.set()
+        finally:
+            self._terminal_pending = False
+            self._terminal_done.set()
 
     def cancel(self) -> None:
         if self.terminal:
@@ -1017,12 +1075,22 @@ class StreamSession:
         self.finished.set()
 
     async def _write(self, frame: dict, *, terminal: bool = False) -> None:
+        async with self._write_lock:
+            await self._write_locked(frame, terminal=terminal)
+
+    async def _write_locked(self, frame: dict, *, terminal: bool = False) -> None:
         if self.cancelled:
             return
         if self.terminal and not terminal:
             return
         try:
             await self._send.write_all(encode_frame(frame))
+        except asyncio.CancelledError:
+            if terminal:
+                # The frame may already be on the wire; never write another.
+                self.cancelled = True
+                self.finished.set()
+            raise
         except Exception as exc:
             logger.debug("iroh stream write failed: %s", type(exc).__name__)
             self.cancelled = True

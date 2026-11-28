@@ -299,7 +299,7 @@ async def test_tool_frame_end_to_end(tmp_path):
         frames = await client.until_terminal()
 
         types = [frame["type"] for frame in frames]
-        assert types == ["start", "tool", "delta", "delta", "done"]
+        assert types == ["start", "tool", "delta", "done"]
         assert types.count("done") == 1
         tool = frames[1]
         assert tool["name"] == "web_search"
